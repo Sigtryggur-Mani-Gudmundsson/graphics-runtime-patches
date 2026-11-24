@@ -125,6 +125,10 @@ On an RTX 4070 Ti, the previously rejected LLVM 19 pixel shader matched the refe
 
 Apply [copy-queue-sync.mbox](copy-queue-sync.mbox) and [buffer-copy-order.mbox](buffer-copy-order.mbox) to the base commit. The two series preserve the contributions in PRs 314 and 354 and add checks for the copy queue's stage filter and an unavailable barrier callback. The dedicated transfer queue on an RTX 4070 Ti reproduced four synchronization hazards before the corrections. [Test results, attribution and reproduction commands](tests/copy-queue-sync/README.md)
 
+## Indexed Xbox quad colors and instance order
+
+The follow-up to tedin7’s rectangle and quad list PR fixes the indexed path. The original GPU replay rendered a full red quad black and drew the wrong overlapping instance last. On the RTX 4070 Ti the patched replay matched the reference in all 4,096 pixels of each of eight synthetic frames. This patch applies to PR #207 head `21dc3889`. [Patch](indexed-quad-replay.mbox) · [Test, results and reproduction steps](tests/indexed-quads/README.md) · [Upstream PR](https://github.com/ubiquitarianism/leonida/pull/207)
+
 ## Recovering a lost presentation surface
 
 The Xbox window presenter can lose its Vulkan surface while checking supported formats or creating a replacement swapchain. The old code handled surface loss during acquire and present, but an error during setup could leave startup without a usable presenter or make it retry the same dead surface. The fix retires the lost surface, keeps the last capture unavailable during recovery and uses the retained window to create a new surface on a later frame. [Source patch and regression test](presenter-surface-recovery.mbox)

@@ -1,0 +1,297 @@
+From ebece7c3029fc60f487edcdc1aba9e92052fc815 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 04:26:25 +0000
+Subject: [PATCH] replay: preserve flat inputs and instance order for indexed
+ Xbox quads
+
+---
+ docs/d3d12_vulkan.md                   |  9 +--
+ runtime/src/vulkan_replay.h            | 76 +++++++++++++++++++++++---
+ runtime/src/vulkan_scratch.h           |  2 +-
+ runtime/test/replay_quad_list_test.cpp | 52 ++++++++++++------
+ runtime/test/vulkan_scratch_test.cpp   |  3 +
+ 5 files changed, 113 insertions(+), 29 deletions(-)
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 7742515a..9a4a7994 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2115,10 +2115,11 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
+ - **Rectangle list**: PSO type 19 builds a triangle-list pipeline plus a generated geometry stage (`src/rect_list_geometry.h`, written from the vertex shader's own outputs) that takes the three corners and emits the strip v1 v2 v3 v4 (same winding). It has to be post-vertex-stage: the translated vertex shaders fetch by V# themselves, and the fourth corner is a function of what they write. A corner value with the same bits at all three corners (a flat attribute) is copied. Needs `geometryShader` (else `E_NOTIMPL`), no application GS, and a vertex shader with no ClipDistance, CullDistance, Layer or ViewportIndex output.
+ - **Quad list**: a non-indexed draw uses a shared index buffer containing the triangle-list pattern
+   `0 1 2, 0 2 3` for each quad. Both triangles start at the first vertex for flat inputs. One draw preserves instance
+-  order and supports up to 16384 quads. The draw's first vertex becomes the vertex offset. Indexed draws still
+-  read the application's index buffer as one four-vertex fan per quad. Vulkan fans use a different provoking
+-  vertex for flat inputs, and overlapping blended instances rasterize quad by quad in this path. The PSO type
+-  is the ordinary triangle type.
++  order and supports up to 16384 quads. The draw's first vertex becomes the vertex offset. Indexed draws expand the application's
++  16- or 32-bit indices in device-local scratch before rendering.
++  They preserve the same provoking vertex and instance order. An incomplete final group of four is ignored.
++  Indices outside the source view read zero. Scratch allocation must succeed and the expanded count must fit
++  a Vulkan indexed draw (at most 715,827,882 complete quads). The PSO type is the ordinary triangle type.
+ 
+ ## 4. Object model mapping
+ 
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index f9dfb6b0..f715c339 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -1071,6 +1071,12 @@ struct PreparedDraw {
+     VkBuffer index_buffer = VK_NULL_HANDLE;
+     VkDeviceSize index_offset = 0;
+     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
++    struct QuadIndices {
++        VkBuffer buffer = VK_NULL_HANDLE;
++        VkDeviceSize offset = 0;
++        std::uint32_t count = 0;       // expanded triangle-list indices
++        std::uint32_t available = 0;   // complete source indices inside the application's view
++    } quad;
+     VkExtent2D area{};
+     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+ 
+@@ -1087,6 +1093,7 @@ struct PreparedDraw {
+         index_buffer = VK_NULL_HANDLE;
+         index_offset = 0;
+         index_type = VK_INDEX_TYPE_UINT16;
++        quad = {};
+         area = {};
+         layers = 1;
+     }
+@@ -2206,19 +2213,72 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
+         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
+         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
+         else if (draw.index.va) return ReplayResult::unsupported;
++        std::uint64_t size = draw.index.va ? draw.index.size : 0;
+         if (!draw.index.va) {  // no index buffer: every index reads 0
+             if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+             p.index_buffer = vk.zero_buffer;
+             p.index_offset = vk.zero_offset;
+         } else {
+-            std::uint64_t size = draw.index.size;
+             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+                 return ReplayResult::unresolved_resource;
+         }
++        if (!draw.mesh && draw.topology == topology_quad_list && draw.count >= 4) {
++            const std::uint32_t quads = draw.count / 4;
++            if (quads > UINT32_MAX / 6) return ReplayResult::unsupported;
++            const std::uint32_t unit = p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
++            const auto source_count = size / unit;
++            p.quad.count = quads * 6;
++            p.quad.available = source_count > draw.first
++                ? std::uint32_t(std::min<std::uint64_t>(quads * 4, source_count - draw.first)) : 0;
++            if (!vk.pipeline_barrier || (p.quad.available && !vk.copy_buffer) ||
++                (p.quad.available < quads * 4 && !vk.fill_buffer) || !vk.copy_scratch ||
++                !vk.copy_scratch(VkDeviceSize(p.quad.count) * unit, p.quad.buffer, p.quad.offset))
++                return ReplayResult::unsupported;
++        }
+     }
+     return ReplayResult::success;
+ }
+ 
++// Expand each group of four GPU-resident indices into (0,1,2) (0,2,3). A single instanced
++// triangle-list draw then preserves the provoking vertex, vertex indices and instance order.
++inline void expand_quad_indices(const ReplayFunctions& vk, VkCommandBuffer cb, const PreparedDraw& d,
++                                std::uint32_t first) {
++    const VkDeviceSize unit = d.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
++    const auto& out = d.quad;
++    constexpr auto transfer_rw = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++    memory_barrier(vk, cb, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                   transfer_rw, VK_PIPELINE_STAGE_TRANSFER_BIT);
++    if (out.available < out.count / 6 * 4) {
++        // A missing or partial input reads zero. Six 16-bit indices are already fill-aligned.
++        vk.fill_buffer(cb, out.buffer, out.offset, out.count * unit, 0);
++        if (out.available)
++            memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++    }
++    // Bound host memory per command independently of the size of the draw.
++    constexpr std::uint32_t batch = 64;
++    std::array<VkBufferCopy, batch * 3> regions;
++    const VkDeviceSize source = d.index_offset + first * unit;
++    for (std::uint32_t begin = 0; begin < out.available; begin += batch * 4) {
++        std::uint32_t n = 0;
++        const auto end = std::min(begin + batch * 4, out.available);
++        for (auto index = begin; index < end; index += 4) {
++            const auto copy = [&](std::uint32_t from, std::uint32_t to, std::uint32_t count) {
++                if (index + from >= end) return;
++                regions[n++] = {source + (index + from) * unit,
++                                out.offset + (VkDeviceSize(index / 4) * 6 + to) * unit,
++                                std::min(count, end - (index + from)) * unit};
++            };
++            copy(0, 0, 3);
++            copy(0, 3, 1);
++            copy(2, 4, 2);
++        }
++        vk.copy_buffer(cb, d.index_buffer, out.buffer, n, regions.data());
++    }
++    memory_barrier(vk, cb, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                   VK_ACCESS_INDEX_READ_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
++}
++
+ inline bool strip_topology(VkPrimitiveTopology topology) {
+     return topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+            topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
+@@ -2239,7 +2299,7 @@ inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
+     // Rectangles draw as triangle lists through a geometry stage. Indexed quads draw as separate fans;
+     // emit() overrides non-indexed quads to a triangle list backed by the shared indices.
+     case topology_rect_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+-    case topology_quad_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
++    case topology_quad_list: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+     }
+ }
+@@ -4140,6 +4200,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+         } else if (const auto* draw = std::get_if<Draw>(&command)) {
+             const detail::PreparedDraw& d = prepared.draws[p.draw];
++            if (d.quad.count) detail::expand_quad_indices(vk, command_buffer, d, draw->first);
+             constexpr VkAccessFlags color_access =
+                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+             constexpr VkAccessFlags depth_access =
+@@ -4203,8 +4264,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+             // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
+             // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
+             if (!draw->mesh) {
+-                const VkPrimitiveTopology topology = draw->topology == topology_quad_list && !draw->indexed
+-                    ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
++                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+                 vk.set_primitive_topology(command_buffer, topology);
+                 const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                      ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+@@ -4223,11 +4283,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+             } else if (draw->topology == topology_quad_list) {
+                 if (draw->indexed) {
+-                    // Indexed quads still read their vertices from the application's index buffer, one fan per quad.
+-                    vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+-                    for (std::uint32_t quad = 0; quad < draw->count / 4; ++quad)
+-                        vk.draw_indexed(command_buffer, 4, draw->instances, draw->first + 4 * quad,
++                    if (d.quad.count) {
++                        vk.bind_index_buffer(command_buffer, d.quad.buffer, d.quad.offset, d.index_type);
++                        vk.draw_indexed(command_buffer, d.quad.count, draw->instances, 0,
+                                         draw->base_vertex, draw->first_instance);
++                    }
+                 } else {
+                     // Both triangles start at the quad's first vertex for flat inputs. One draw also preserves
+                     // the original instance order, and VertexIndex - BaseVertex still gives 4q + k.
+diff --git a/runtime/src/vulkan_scratch.h b/runtime/src/vulkan_scratch.h
+index 4a8a59dd..6cfee2ba 100644
+--- a/runtime/src/vulkan_scratch.h
++++ b/runtime/src/vulkan_scratch.h
+@@ -148,7 +148,7 @@ private:
+     bool make_chunk(std::uint64_t size, Chunk& out) {
+         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+         info.size = size;
+-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
+         VkMemoryRequirements requirements{};
+         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
+diff --git a/runtime/test/replay_quad_list_test.cpp b/runtime/test/replay_quad_list_test.cpp
+index 15b0c7e7..a08cdd81 100644
+--- a/runtime/test/replay_quad_list_test.cpp
++++ b/runtime/test/replay_quad_list_test.cpp
+@@ -1,5 +1,4 @@
+-// Quad lists without an index buffer are one triangle-list draw. A switch back to Vulkan triangle fans
+-// changes the provoking vertex for flat attributes and the order of overlapping blended instances.
++// Both quad paths emit one instanced triangle-list draw, preserving the provoking vertex and instance order.
+ #include "../src/vulkan_replay.h"
+ 
+ #include <cstdint>
+@@ -64,20 +63,34 @@ int main() {
+     const auto app_buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
+ 
+     GraphicsPipeline graphics{};
++    graphics.pipeline = reinterpret_cast<VkPipeline>(std::uintptr_t{3});
++    const auto scratch = reinterpret_cast<VkBuffer>(std::uintptr_t{4});
++    vk.graphics_pipeline = [&](std::uintptr_t) { return &graphics; };
++    vk.buffer_at = [&](std::uint64_t, std::uint64_t&, VkBuffer& buffer, VkDeviceSize& offset) {
++        buffer = app_buffer;
++        offset = 32;
++        return true;
++    };
++    vk.copy_scratch = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceSize& offset) {
++        if (size > 256) return false;
++        buffer = scratch;
++        offset = 64;
++        return true;
++    };
++    vk.image_view = [](const ResourceBinding&, const VkImageSubresourceRange&) { return VkImageView{}; };
++    vk.draw = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) {};
++    vk.bind_vertex_buffers2 = +[](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkBuffer*, const VkDeviceSize*,
++                                  const VkDeviceSize*, const VkDeviceSize*) {};
++    vk.copy_buffer = +[](VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t, const VkBufferCopy*) {};
++    vk.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
++                              std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
++                              std::uint32_t, const VkImageMemoryBarrier*) {};
+     const auto collect = [&](const Draw& draw) {
+         calls.clear();
+         CommandList list;
+         if (!list.draw(draw) || !list.close()) return false;
+-        PreparedList prepared;
+-        prepared.list = &list;
+-        prepared.commands.resize(1);
+-        prepared.commands[0].draw = 0;
+-        auto& entry = prepared.draws.emplace_back();
+-        entry.graphics = &graphics;
+-        entry.index_buffer = app_buffer;
+-        entry.index_offset = 32;
+-        emit(prepared, VK_NULL_HANDLE, vk);
+-        return true;
++        const auto resolve = [](ResourceId) -> const ResourceBinding* { return nullptr; };
++        return replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success;
+     };
+ 
+     Draw draw{};
+@@ -102,9 +115,16 @@ int main() {
+     draw.count = 8;
+     draw.first = 5;
+     draw.base_vertex = -2;
+-    const DrawCall first_fan{VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, app_buffer, 32, VK_INDEX_TYPE_UINT16, 4, 2, 5, -2, 7};
+-    const DrawCall second_fan{VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, app_buffer, 32, VK_INDEX_TYPE_UINT16, 4, 2, 9, -2, 7};
+-    ok &= check(collect(draw) && calls == std::vector{first_fan, second_fan},
+-                "indexed quads use the application's index buffer and base vertex");
++    draw.index = {0x1000, 26, 57};
++    const DrawCall indexed{VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, scratch, 64, VK_INDEX_TYPE_UINT16, 12, 2, 0, -2, 7};
++    ok &= check(collect(draw) && calls == std::vector{indexed}, "indexed quads preserve per-draw bases");
++    draw.count = 3;
++    ok &= check(collect(draw) && calls.empty(), "incomplete indexed quad emits no draw");
++    draw.count = 8;
++    draw.index.size = 24;
++    ok &= check(!collect(draw) && calls.empty(), "truncated view needs a zero fill");
++    draw.index.size = 26;
++    vk.pipeline_barrier = nullptr;
++    ok &= check(!collect(draw) && calls.empty(), "missing copy dependency refuses the list before emission");
+     return ok ? 0 : 1;
+ }
+diff --git a/runtime/test/vulkan_scratch_test.cpp b/runtime/test/vulkan_scratch_test.cpp
+index 8ca6a819..bf39b642 100644
+--- a/runtime/test/vulkan_scratch_test.cpp
++++ b/runtime/test/vulkan_scratch_test.cpp
+@@ -31,6 +31,7 @@ struct FakeVulkan {
+     std::unordered_set<std::uintptr_t> live_memory;
+     std::unordered_map<std::uintptr_t, std::uint64_t> semaphore_values;
+ 
++    VkBufferUsageFlags buffer_usage = 0;
+     int create_buffer_calls = 0;
+     int destroy_buffer_calls = 0;
+     int allocate_calls = 0;
+@@ -52,6 +53,7 @@ const VkDevice k_device = make_handle<VkDevice>(0x100);
+ VKAPI_ATTR VkResult VKAPI_CALL fake_create_buffer(
+     VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* out) {
+     ++g_vk->create_buffer_calls;
++    g_vk->buffer_usage = info->usage;
+     if (g_vk->create_buffer_result != VK_SUCCESS) return g_vk->create_buffer_result;
+     const std::uintptr_t id = g_vk->next_buffer++;
+     g_vk->live_buffers[id] = info->size;
+@@ -157,6 +159,7 @@ int main() {
+             EXPECT(vk.create_buffer_calls == 0);
+ 
+             EXPECT(scratch.get(100, buf, off));
++            EXPECT(vk.buffer_usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+             const VkBuffer chunk1 = buf;
+             EXPECT(chunk1 != VK_NULL_HANDLE && off == 0);
+             EXPECT(vk.live_buffers[reinterpret_cast<std::uintptr_t>(chunk1)] == k_4mib);
+-- 
+2.56.1
+
