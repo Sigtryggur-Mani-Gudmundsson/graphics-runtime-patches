@@ -90,6 +90,19 @@ Both rows used the same full-screen triangle on an RTX 4070 Ti. A Windows build 
 
 With LLVM’s AMDGPU assembler, SPIRV-Tools, glslangValidator, a C++20 compiler and Python on Linux, run `python -I tests/pixel-input-signature/render.py /path/to/patched/source /path/to/vk_harness`. [Reproduction script](tests/pixel-input-signature/render.py)
 
+## Pixel shader front-face masks
+
+Apply [front-face-mask.mbox](front-face-mask.mbox) with `git am` on the base commit. The resulting standalone tree is `11dccca8bd04ab16dec89a39f8aacf7cf497741a`. The first commit restores Rafael’s translator fix and unit test. The second adds a mixed-winding GPU regression. [Upstream PR and evidence](https://github.com/ubiquitarianism/leonida/pull/40)
+
+The test renders two quads with opposite winding. Its hand-written pixel shader checks the facing register for nonzero, all bits set, and zero. On an RTX 4070 Ti the original translator produced the same color for all 4,096 pixels. The patched shader matched a GLSL reference pixel for pixel, with 2,048 pixels of each winding. This test uses synthetic geometry and shaders.
+
+With a built vk_harness, glslangValidator, spirv-as and spirv-val available, run these commands from the patched checkout.
+
+```sh
+python3 -I tests/test_ps_front_face.py
+LEONIDA_VK_HARNESS=/absolute/path/to/vk_harness python3 -I tests/test_ps_front_face_gpu.py
+```
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.

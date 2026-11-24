@@ -1,0 +1,191 @@
+From a5c1ac3af05cbe4766613d6b9618872a365e4480 Mon Sep 17 00:00:00 2001
+From: Rafael <rafaelalvesp2005@gmail.com>
+Date: Mon, 23 Nov 2026 06:37:34 -0300
+Subject: [PATCH 1/2] rdna2spirv: restore the all-bits pixel front-face mask
+
+Adapt SHADER-892 from ubiquitarianism/leonida PR 40 (5c85e233a and eea1754ea). Preserve the mask-mode evidence and the zero-compare limitation in the current design table.
+
+Source: https://github.com/ubiquitarianism/leonida/pull/40
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/docs/design.md b/docs/design.md
+index 0bad89ec361bdcfd81b5aab98cdca0e291682c75..44d11d701c2ee895a7c1abc52060a5982a7eb41e 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -293,7 +293,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Flat and scratch store operands | Register analysis reads the full address and data VGPR ranges and defines neither. A store after a block terminator can still appear in the listing scanned for PS live-ins. The CPU branch regression in `tests/semantic/test_store_liveins.py` checks both exported barycentric weights. LLVM gfx1013 confirms operand order. Reachable flat and scratch stores still raise `Unsupported`. |
+ | Vertex fetch | `s_swappc_b64` at the start of a VS calls a driver-generated fetch program that isn't in the blob. It's replaced by Vulkan vertex inputs: each `ISG1` input-signature element (DXBC container) becomes an input at **location = its D3D input register**, typed by its component type, and is written to **v(4 + 4·register + component)**. That rule was checked over all 788 fetch-calling shaders: in 783 every read-before-write VGPR is predicted by it (715 exact). Reads of components the element doesn't declare (e.g. `.w` of an `xyz` position, 3 VS) are allowed: the fetch returns the format defaults (0, 0, 1), and Vulkan fills a `vec4` input from a narrower format the same way. Inputs are declared as `vec4`. **The runtime must bind vertex buffers by the game's D3D12 input layout, location = input register.** |
+ | `v_swap_b32` and pixel inputs | The swap reads and writes both VGPRs (AMD RDNA2 ISA, VOP1). A barycentric coordinate in the first operand is therefore a live input, and a coordinate or copy in the second operand is overwritten. When the swap changes an interpolation weight, the other incoming weight is still available to the pair. Checked by `tests/semantic/test_interp_computed_ij.py`: `test_swap_reads_both_incoming_barycentrics`, `test_swap_overwrites_interpolation_weight_in_second_operand` and `test_swapped_copies_swap_the_weights` run synthetic fragment exports through the SPIR-V interpreter. |
+-| PS system inputs | v0–v1 = barycentrics (consumed by `v_interp`, which becomes attribute inputs). **v2.. = the `SV_Position` components the shader reads, packed in order**. Counted over all 12,101 PS listings of 1.0.2.1 (names starting with `.` included; `rdna2spirv.read_before_write_vgprs`, with `v_interp`'s I/J operands left out as the translator does, against the ISG1 read masks from `input_signature_full`; an earlier sample gave 2,531 of 3,000): in 12,098 the VGPRs they read before writing inside the system-input range (v2 up to the last hardware input) equal exactly the position components their input signature reads, then front face when its read mask is non-zero. The 1,639 PS that declare `SV_IsFrontFace` with read mask 0 never read that slot; the translator still places it, last of the inputs this layout models, so no other modelled input moves. The other 3 read fewer position components than their read mask says. Verified on 2,531 of 3,000 PS: the VGPRs they read before writing equal exactly the position components their input signature reads. Filled from `FragCoord`: xy/z directly, and **w directly too**, because AMD's position-w register holds 1/w (Mesa lowers `load_frag_coord_w_rcp` straight to `frag_pos[3]`, `ac_nir_lower_intrinsics_to_args.c`), the same as Vulkan's `FragCoord.w`. **Front face** follows the used position components when the signature declares `SV_IsFrontFace`, as ±1.0 (Mesa: `load_front_face` = `front_face > 0`). Only enabled inputs are packed, in hardware order (Mesa `radv_shader_args.c`: barycentric pairs, POS_X/Y/Z/W, FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT). That explains the earlier "unverified" shaders: of the 345 PS that read front face, 130 read pos.xy + front face and 141 pos.x/y/w + front face. That explains the earlier "unverified" shaders: 102 read pos.xy + front face, and 76 read pos.x/y/w + front face. **Raw barycentric reads** (321 PS, e.g. `v_readfirstlane_b32 s41, v1`): AMD interpolates P = P0 + i(P1 − P0) + j(P2 − P0), so i/j are the weights of vertices 1/2, which is `BaryCoordKHR.y`/`.z` (`VK_KHR_fragment_shader_barycentric`). GPU-checked with `runtime/test/shaders/ps_bary.asm`: raw i/j equal the interpolated weights on every pixel. `ps_persp_bary.asm` (the same code drawn by `vs_persp.asm`, clip w = 1, 2, 4) checks them, and the interpolated attributes, against perspective-correct CPU weights; the affine weights differ by at least 0.006 on every covered pixel (all 1158 judged), so `NoPerspective` interpolation fails it. The pair is perspective-center, the only pair this layout models; that holds for every corpus PS (row "PS interpolation modes"). A PS that reads any other unexplained register inside the system-input range is still rejected (none left in the corpus). Reads past the last hardware input are values undefined on some path, so zero stands in for them. 373 PS have one (and 85 more whose raw listing holds embedded data words). In each of the 373 a branch instruction comes earlier in listing order than the first such read; in 364 the register is written later in listing order, which suggests a loop-carried value (inferred from listing order, not measured on the control flow), in 9 never after the read. All register arrays start at zero, so translated shaders are deterministic. |
++| PS system inputs | v0–v1 = barycentrics (consumed by `v_interp`, which becomes attribute inputs). **v2.. = the `SV_Position` components the shader reads, packed in order**. Counted over all 12,101 PS listings of 1.0.2.1 (names starting with `.` included; `rdna2spirv.read_before_write_vgprs`, with `v_interp`'s I/J operands left out as the translator does, against the ISG1 read masks from `input_signature_full`; an earlier sample gave 2,531 of 3,000): in 12,098 the VGPRs they read before writing inside the system-input range (v2 up to the last hardware input) equal exactly the position components their input signature reads, then front face when its read mask is non-zero. The 1,639 PS that declare `SV_IsFrontFace` with read mask 0 never read that slot; the translator still places it, last of the inputs this layout models, so no other modelled input moves. The other 3 read fewer position components than their read mask says. Verified on 2,531 of 3,000 PS: the VGPRs they read before writing equal exactly the position components their input signature reads. Filled from `FragCoord`: xy/z directly, and **w directly too**, because AMD's position-w register holds 1/w (Mesa lowers `load_frag_coord_w_rcp` straight to `frag_pos[3]`, `ac_nir_lower_intrinsics_to_args.c`), the same as Vulkan's `FragCoord.w`. **Front face** follows the used position components when the signature declares `SV_IsFrontFace`. The translator writes the RDNA2 all-bits mask, 0xffffffff for front and 0 for back. The SHADER-892 survey found that all 345 pixel shaders reading this input first compare it to integer zero. Either signed float encoding of one has nonzero bits. Those comparisons alone establish the zero/nonzero distinction. The all-bits value comes from the hardware mask mode measured on gfx1036 (#5123). Only enabled inputs are packed, in hardware order (Mesa `radv_shader_args.c`: barycentric pairs, POS_X/Y/Z/W, FRONT_FACE, ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT). That explains the earlier "unverified" shaders: of the 345 PS that read front face, 130 read pos.xy + front face and 141 pos.x/y/w + front face. That explains the earlier "unverified" shaders: 102 read pos.xy + front face, and 76 read pos.x/y/w + front face. **Raw barycentric reads** (321 PS, e.g. `v_readfirstlane_b32 s41, v1`): AMD interpolates P = P0 + i(P1 − P0) + j(P2 − P0), so i/j are the weights of vertices 1/2, which is `BaryCoordKHR.y`/`.z` (`VK_KHR_fragment_shader_barycentric`). GPU-checked with `runtime/test/shaders/ps_bary.asm`: raw i/j equal the interpolated weights on every pixel. `ps_persp_bary.asm` (the same code drawn by `vs_persp.asm`, clip w = 1, 2, 4) checks them, and the interpolated attributes, against perspective-correct CPU weights; the affine weights differ by at least 0.006 on every covered pixel (all 1158 judged), so `NoPerspective` interpolation fails it. The pair is perspective-center, the only pair this layout models; that holds for every corpus PS (row "PS interpolation modes"). A PS that reads any other unexplained register inside the system-input range is still rejected (none left in the corpus). Reads past the last hardware input are values undefined on some path, so zero stands in for them. 373 PS have one (and 85 more whose raw listing holds embedded data words). In each of the 373 a branch instruction comes earlier in listing order than the first such read; in 364 the register is written later in listing order, which suggests a loop-carried value (inferred from listing order, not measured on the control flow), in 9 never after the read. All register arrays start at zero, so translated shaders are deterministic. |
+ | Partial pixel color exports | Each MRT retains channels from earlier exports when the current `exp` disables them. Uncompressed exports enable individual RGBA channels and compressed exports enable the RG and BA pairs. Partial MRT outputs start at zero so a channel the shader never writes keeps its existing translator default. The CPU test in `tests/semantic/test_export_valid_mask.py` checks the eight RGBA words from two interleaved targets in `partial_color_exports.asm`. [AMD RDNA 2 ISA, sections 11.1 and 11.2.1](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) |
+ | Inputs and outputs | VS: **legacy (non-NGG) hardware VS, measured** over all 2,236 (`scripts/vs_input_survey.py`): no `exp prim`, no `s_sendmsg` (so no `GS_ALLOC_REQ`) and no `v_mbcnt` in any of them, and every one exports `pos0` and `param`. The input VGPRs are Mesa's GFX10 legacy-VS layout (`radv_shader_args.c`, `declare_vs_input_vgprs`, not `is_ngg`): `v0` = vertex id, `v1` unused, `v2` = primitive id, `v3` = instance id. On entry no VS reads `v1` or `v2`; 788 start with the fetch call (see *Vertex fetch*) and read the fetched attributes from `v4` up, and of the other 1,448, 1,052 read `v0` only, 386 `v0` and `v3`, and 10 neither (NGG would have put the VS inputs at `v5`/`v8`, after five GS VGPRs). **Both ids are zero-based on the hardware**: `v0` excludes the draw's base vertex and `v3` its first instance (Mesa `ac_nir_lower_intrinsics_to_args.c`: `vertex_id` is `load_vertex_id_zero_base`, `instance_id` is `load_instance_id`; the bases come in the `base_vertex` / `start_instance` SGPRs). Vulkan's `VertexIndex` / `InstanceIndex` include `firstVertex`/`vertexOffset` / `firstInstance`, so the translator seeds `v0 = VertexIndex - BaseVertex` and `v3 = InstanceIndex - BaseInstance` (`DrawParameters`, device feature `shaderDrawParameters`, in every VS's `features`). GPU-checked with `runtime/test/shaders/vs_base_ids.asm` (`VKH_DRAW=16,7`): `0x101` on every pixel, where `VertexIndex`/`InstanceIndex` alone gave `0x7111`. `exp pos0` → `Position`, `exp pos1..pos3` → `ClipDistance` / `CullDistance` (and `Layer`/`ViewportIndex` in VS when `pos1` is the misc vector), `exp paramN` → location N. RDNA2/GFX10 packs clip distances before cull distances contiguously across 4-component `pos` exports (up to 8 floats total), starting at `pos2` when a misc vector (`PointSize`, `EdgeFlag`, `ShadingRate`, `Layer`, `ViewportIndex`; GFX9+ packs `Layer` in `z[10:0]` and `ViewportIndex` in `z[19:16]`) occupies `pos1`, and at `pos1` otherwise (Mesa `src/amd/common/nir/ac_nir_prerast_utils.c`: `ac_nir_export_position`; AMD LLPC `lgc/lowering/LowerInOut.cpp`: `LowerInOut::visitReturnInst`). Slot assignment follows the DXBC `OSG1` signature (`SV_ClipDistance` = 2, `SV_CullDistance` = 3, `SV_RenderTargetArrayIndex` = 4, `SV_ViewportArrayIndex` = 5, `SV_ShadingRate` = 23), ordered by `(semantic_index, register, component)` with clip before cull; when `OSG1` is absent (or declares none of those system values), `pos1..pos3` exports are discarded. PS: `v_interp_*` attribute N → input location N. `exp mrtK` → the location of the K-th declared `SV_Target` (**Pixel colour exports**): colour exports are packed, so a shader that declares `SV_Target0` and `SV_Target2` exports `mrt0` and `mrt1`, and `mrt1` is render target 2. Counted over the 1.0.2.1 corpus (SHADER-210): of 10,500 pixel shaders with `SV_Target` outputs (OSG1 system value 64, register = semantic index in all 29,290), the 221 that declare non-consecutive targets all export `mrt0`..`mrt(k-1)`, never `mrtN` at register N. Without an OSG1 (hand-written listings, `run_gpu_tests.py` fixtures) `mrtK` is location K. An export past the declared targets is `Unsupported`. `tests/semantic/test_sparse_sv_target.py`. `exp mrtN` → location N, `exp mrtz` x → `FragDepth` only when x is on in an uncompressed export; the 16-bit `compr` form holds stencil and sample mask, never Z (Mesa `ac_nir_lower_ps_late.c` `emit_ps_mrtz_export`), and an export without Z must not declare `DepthReplacing`. `exp mrtN` → location N, `exp mrtz` x → `FragDepth`. |
+ | VS input layout, per PAL hardware stage | `scripts/vs_layout_census.py` joins every tag-0x0D payload's PAL stage record (`tools/pal_stages.py`) with its code markers over all 26,698 payloads of the 26,503 1.0.2.1 containers: the 2,236 stage-4 (VS) payloads are **all** legacy non-NGG — no `exp prim`, no `s_sendmsg`, no `v_mbcnt`, and every one exports `pos0` and `param` — so the Mesa GFX10 legacy-VS layout of *Inputs and outputs* holds for every VS the corpus translates, and `v0` = `VertexIndex` (zero-based, `DrawParameters`) is confirmed rather than NGG. The NGG markers belong to the 9,282 stage-7 payloads (every one has `exp prim`, `s_sendmsg MSG_GS_ALLOC_REQ` and `v_mbcnt`), the 195 stage-3 payloads are the geometry shaders (`s_sendmsg` + `v_mbcnt`, no position export), and the 195 stage-2 payloads are the ES variants of the next row; the PS (12,101) and CS (2,689) payloads carry `v_mbcnt` (332 and 266) and, in ten PS, an `s_sendmsg`, but no `exp prim`. |
+diff --git a/tests/test_ps_front_face.py b/tests/test_ps_front_face.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..43bdd4709d3fe1bd828b983664a86b792adebad7
+--- /dev/null
++++ b/tests/test_ps_front_face.py
+@@ -0,0 +1,47 @@
++"""The FRONT_FACE pixel-shader system VGPR holds 0xffffffff (front) / 0 (back) (SHADER-892).
++
++On RDNA2 the VGPR is 0xffffffff / 0 when SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS = 1 and +1.0 / -1.0 when it is 0
++(#5123). Every one of the game's 345 pixel shaders that reads it tests it as an integer against 0, which only the
++mask form answers correctly (+1.0 and -1.0 are both non-zero). This translates a hand-written PS that reads it the
++same way, after the two SV_Position components it reads, and checks what the translator stores. No game data.
++"""
++import os
++import re
++import sys
++import unittest
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(ROOT, "tests"))
++
++from test_shader_meta import isg1_chunk, make_dxbc, translate_synthetic  # noqa: E402
++
++# SV_Position (system value 1) with x and y read, then SV_IsFrontFace (system value 9): v2, v3 = x, y; v4 = facing.
++SIGNATURE = make_dxbc([isg1_chunk([("SV_Position", 0, 0, 0xF, 0x3, 1, 3),
++                                   ("SV_IsFrontFace", 0, 1, 0x1, 0x1, 9, 1)])])
++LINES = [
++    "v_cmp_ne_u32_e32 vcc_lo, 0, v4",
++    "v_cndmask_b32_e64 v0, 0, 1.0, vcc_lo",
++    "exp mrt0 v0, v0, v0, v0 done vm",
++    "s_endpgm",
++]
++
++
++class FrontFaceMaskTest(unittest.TestCase):
++    def test_front_face_is_stored_as_all_bits_or_zero(self):
++        asm, _ = translate_synthetic("ps_front_face", LINES, dxbc=SIGNATURE)
++        self.assertIn("BuiltIn FrontFacing", asm)
++        select = re.search(r"%ffu = OpSelect %uint %ff (%\S+) (%\S+)", asm)
++        self.assertIsNotNone(select, "FRONT_FACE is not stored as a uint select")
++        consts = dict(re.findall(r"(%\S+) = OpConstant %uint (\d+)", asm))
++        self.assertEqual(int(consts[select.group(1)]), 0xFFFFFFFF)  # front
++        self.assertEqual(int(consts[select.group(2)]), 0)           # back
++        # The float form (+1.0 / -1.0) is gone: nothing negates 1.0 for the facing value.
++        self.assertNotIn("%ffm1", asm)
++        # And the value goes into the VGPR the shader reads, v4.
++        store = re.search(r"%ffp = OpAccessChain %_ptr_Function_uint %vgpr (%\S+)", asm)
++        self.assertIsNotNone(store)
++        self.assertEqual(int(consts[store.group(1)]), 4)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 79ef42ea12419c237fd28430218dcd1cf745d430..645e2fb3b5489bac570cd675f8cb4c543893d50b 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -16007,8 +16007,12 @@ def assemble(gen):
+                        f"%bcp{k} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %bcp{k} %bcu{k}"]
+                 continue
+             if c == "front":
+-                fn += ["%ff = OpLoad %bool %front_facing", "%ffm1 = OpFNegate %float %f1",
+-                       "%ffv = OpSelect %float %ff %f1 %ffm1", "%ffu = OpBitcast %uint %ffv",
++                # The mask form, 0xffffffff front / 0 back (SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS = 1, #5123): every
++                # one of the corpus's 345 PS that reads FRONT_FACE tests it as an integer against 0 (344
++                # v_cmp_ne_u32, 1 v_cmp_eq_u32; SHADER-892), which the float form (+1.0 / -1.0, both non-zero)
++                # would call front for every face.
++                fn += ["%ff = OpLoad %bool %front_facing",
++                       f"%ffu = OpSelect %uint %ff {gen.cu(0xFFFFFFFF)} {gen.cu(0)}",
+                        f"%ffp = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", "OpStore %ffp %ffu"]
+                 continue
+             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
+@@ -17449,8 +17453,8 @@ def translate(path):
+         # lowers nir_intrinsic_load_frag_coord_w_rcp straight to frag_pos[3]. That's the same value as Vulkan's
+         # FragCoord.w, so all four components map directly.
+         # Hardware order (Mesa src/amd/vulkan/radv_shader_args.c): barycentric pairs, ..., POS_X/Y/Z/W, FRONT_FACE,
+-        # ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT. Only enabled inputs are packed. Front face is a float whose
+-        # sign gives facing (Mesa: load_front_face = front_face > 0; load_front_face_fsign = the raw value).
++        # ANCILLARY, SAMPLE_COVERAGE, POS_FIXED_PT. Only enabled inputs are packed. Front face holds 0xffffffff
++        # (front) / 0 (back), the form the game's shaders test (SHADER-892; Mesa's float form is +1.0 / -1.0).
+         layout = {}
+         nxt = 2
+         for c in range(4):
+
+From 58bcf52e33486903bcca0521d87df896425c3e62 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 03:13:02 +0000
+Subject: [PATCH 2/2] Test translated front-face masks against a mixed-winding
+ Vulkan draw
+
+
+diff --git a/tests/test_ps_front_face_gpu.py b/tests/test_ps_front_face_gpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c572a576130520940846eb650eedb3c8db5ceb74
+--- /dev/null
++++ b/tests/test_ps_front_face_gpu.py
+@@ -0,0 +1,70 @@
++"""Set LEONIDA_VK_HARNESS to a built vk_harness to run this synthetic Vulkan test."""
++from collections import Counter
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from test_ps_front_face import SIGNATURE
++from test_shader_meta import translate_synthetic
++
++
++class FrontFaceDrawTest(unittest.TestCase):
++    @unittest.skipUnless(os.environ.get("LEONIDA_VK_HARNESS"), "requires LEONIDA_VK_HARNESS")
++    def test_mixed_winding_matches_vulkan(self):
++        # One full-height quad per half of the image, with opposite winding.
++        vertices = (-1, -1, 0, -1, -1, 1, 0, 1, 0, -1, 1, -1, 0, 1, 1, 1)
++        indices = (0, 1, 2, 1, 3, 2, 4, 6, 5, 5, 6, 7)
++        lines = [
++            "v_cmp_ne_u32_e32 vcc_lo, 0, v4",
++            "v_cndmask_b32_e64 v0, 0, 1.0, vcc_lo",
++            "v_cmp_eq_u32_e32 vcc_lo, -1, v4",
++            "v_cndmask_b32_e64 v1, 0, 1.0, vcc_lo",
++            "v_cmp_eq_u32_e32 vcc_lo, 0, v4",
++            "v_cndmask_b32_e64 v2, 0, 1.0, vcc_lo",
++            "v_mov_b32_e32 v3, 1.0",
++            "exp mrt0 v0, v1, v2, v3 done vm",
++            "s_endpgm",
++        ]
++        asm, _ = translate_synthetic("ps_front_face_draw", lines, dxbc=SIGNATURE)
++        harness = Path(os.environ["LEONIDA_VK_HARNESS"]).resolve()
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            env = {k: v for k, v in os.environ.items() if not k.startswith("VKH_")}
++            env.update(VKH_DRAW_MESH=str(root / "mesh"), VKH_VERTEX_LAYOUT="0:2f")
++            (root / "mesh").write_bytes(struct.pack("<II16f12I", 8, 12, *vertices, *indices))
++            (root / "quad.vert").write_text(
++                "#version 450\nlayout(location=0) in vec2 p;\n"
++                "void main() { gl_Position = vec4(p, 0, 1); }\n")
++            (root / "reference.frag").write_text(
++                "#version 450\nlayout(location=0) out vec4 c;\n"
++                "void main() { c = gl_FrontFacing ? vec4(1,1,0,1) : vec4(0,0,1,1); }\n")
++            (root / "actual.asm").write_text(asm)
++
++            def run(*args):
++                subprocess.run(args, cwd=root, env=env, check=True, timeout=60)
++
++            for source in ("quad.vert", "reference.frag"):
++                run("glslangValidator", "-V", source, "-o", source + ".spv")
++            run("spirv-as", "--target-env", "vulkan1.3", "actual.asm", "-o", "actual.spv")
++            run("spirv-val", "--target-env", "vulkan1.3", "actual.spv")
++
++            def render(fragment):
++                run(harness, "quad.vert.spv", fragment, "pixels.raw", "64", "64")
++                data = (root / "pixels.raw").read_bytes()
++                self.assertEqual(len(data), 64 * 64 * 16)
++                return list(struct.iter_unpack("<4f", data))
++
++            expected = render("reference.frag.spv")
++            self.assertEqual(Counter(expected), {(1, 1, 0, 1): 2048, (0, 0, 1, 1): 2048})
++            actual = render("actual.spv")
++            mismatches = sum(a != b for a, b in zip(actual, expected))
++            self.assertEqual(mismatches, 0, f"out of 4096 pixels, actual colors {Counter(actual)}")
++
++
++if __name__ == "__main__":
++    unittest.main()
