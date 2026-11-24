@@ -2,6 +2,10 @@
 
 Ten source and test commits for the Leonida compatibility runtime, based on `de4c37383cad386eaa851047628d7b92c51009c5`. The series includes Wine test registration, Vulkan presentation and capture fixes, shader translation fixes, audio structure sizes, descriptor heap routing and regression tests. All GPU and audio results below use synthetic fixtures. Retail startup is unverified.
 
+## Refreshing title-backed descriptor tables
+
+On the frame-loop branch, the GPU missed updates to descriptors in a rebound table. The two commits in [descriptor-table-refresh.mbox](descriptor-table-refresh.mbox) connect the Xbox heap backing to the submission-time scan, retain the largest declared range at each address, and route the scan through the submitting device. On an RTX 4070 Ti under Wine, reusing the same closed list produced the expected new 64-word pattern on both submissions. This also passed with a second compatibility device alive. [Controls, reproduction and combined patch order](tests/descriptor-table-refresh/README.md)
+
 ## Optional graphics layout on the frame-loop branch
 
 Apply [graphics-root-layout.mbox](graphics-root-layout.mbox) to Mumogg's frame-loop branch at `e0d4fd2b81e6636b1c6bb2f76be79e910e84d84b`. The fix accepts descriptor tables that fit the selected graphics layout and preserves both address words when a signature falls back to the default layout. A synthetic 17-table draw failed before submission on the original branch. With the fix, three draws produced the expected values across all 4,096 pixels on an RTX 4070 Ti under Wine. [Regression cases and pixel reproduction](tests/graphics-root-layout/README.md)
