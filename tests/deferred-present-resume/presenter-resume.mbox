@@ -1,0 +1,61 @@
+From 675f6909bcad3af34d94150903e7fe6c24625944 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 17:21:23 +0000
+Subject: [PATCH] Check that a waiting frame resumes after the full present
+ queue drains
+
+---
+ runtime/test/vk_presenter_sync_test.cpp | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/test/vk_presenter_sync_test.cpp b/runtime/test/vk_presenter_sync_test.cpp
+index d630c1e..e66c0e7 100644
+--- a/runtime/test/vk_presenter_sync_test.cpp
++++ b/runtime/test/vk_presenter_sync_test.cpp
+@@ -29,6 +29,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <functional>
++#include <future>
+ #include <mutex>
+ #include <string_view>
+ #include <thread>
+@@ -410,6 +411,11 @@ int main() {
+             EXPECT(noop.close());
+             const CommandList* ptr = &noop;
+             const std::uint64_t shown = presenter.presented();
++            std::promise<void> at_capacity;
++            auto entered_wait = at_capacity.get_future();
++            std::once_flag reported;
++            std::future<VkResult> next_frame;
++            bool waited_for_room = false;
+             {
+                 VulkanQueue doomed(context, d.queue, d.family);
+                 EXPECT(doomed.ok());
+@@ -423,9 +429,21 @@ int main() {
+                 const auto refused = presenter.present_blank(true);
+                 presenter.set_abort({});
+                 EXPECT(refused == VK_NOT_READY);
++
++                // Keep waiting this time. Confirm the caller observed a full queue before releasing the held work.
++                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
++                presenter.set_abort([&, deadline] {
++                    std::call_once(reported, [&] { at_capacity.set_value(); });
++                    return std::chrono::steady_clock::now() >= deadline;
++                });
++                next_frame = std::async(std::launch::async, [&] { return presenter.present(1, true); });
++                waited_for_room = entered_wait.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+             }
+-            EXPECT(presenter.presented() == shown + VulkanPresenter::max_deferred_presents);
+-            std::printf("presenter sync: Present queued behind a destroyed queue's held work ran\n");
++            const auto resumed = next_frame.get();
++            presenter.set_abort({});
++            EXPECT(waited_for_room && resumed == VK_SUCCESS);
++            EXPECT(presenter.presented() == shown + VulkanPresenter::max_deferred_presents + 1);
++            std::printf("presenter sync: full queue drained and the waiting frame was presented once\n");
+         }
+ 
+         // 3. Concurrent present() + VulkanQueue::execute() + add/remove_resource() hammering LayoutTracker.
+-- 
+2.56.1
+
