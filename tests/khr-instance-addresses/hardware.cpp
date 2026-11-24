@@ -79,7 +79,7 @@ struct HostBuffer {
         external.handleTypes = handle_type;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
         info.size = 128;
-        info.usage = input | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        info.usage = input | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         CHECK(FN(vkCreateBuffer)(d.device, &info, nullptr, &buffer) == VK_SUCCESS);
         VkMemoryRequirements req{};
         FN(vkGetBufferMemoryRequirements)(d.device, buffer, &req);
@@ -110,6 +110,48 @@ struct HostBuffer {
         return false;
     }
 };
+
+// Revisions predating the direct-input fix lack this binding field. Keeping the fixture identical
+// lets the baseline exercise the same valid memory, triangle and rays.
+template <class Binding> void set_import_address(Binding &binding, VkDeviceAddress address) {
+    if constexpr (requires { binding.imported_address; })
+        binding.imported_address = address;
+}
+
+bool check_xdxr_vertices(vktest::Device &d, const ResourceBinding &binding, VkDeviceAddress heap,
+                         BuildAccelerationStructure build) {
+    VulkanContext context(d.device_proc, d.device, true, false, false, true);
+    CHECK(context.xdxr_acceleration_structures());
+    context.set_heap_base(heap);
+    context.add_resource(10, binding);
+    VulkanQueue queue(context, d.queue, d.family);
+    CHECK(queue.ok());
+    XdxrLayout layout;
+    CHECK(layout.compute(1, false));
+    void *mapped = nullptr;
+    auto dst = d.buffer(layout.size + 255, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &mapped);
+    auto scratch = d.buffer(layout.scratch + 255, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr);
+    CHECK(dst && scratch);
+    const auto base = d.device_address(dst);
+    const auto aligned = (base + 255) & ~uint64_t(255);
+    build.dst_va = aligned - heap;
+    build.scratch_va = ((d.device_address(scratch) + 255) & ~uint64_t(255)) - heap;
+    CommandList list;
+    CHECK(list.build_acceleration_structure(build) && list.close());
+    const CommandList *lists[]{&list};
+    CHECK(queue.execute(lists) == ReplayResult::success && queue.idle());
+    CHECK(d.run([&](auto cb) {
+        barrier(d, cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+        return true;
+    }));
+    std::array<float, 6> bounds{};
+    std::memcpy(bounds.data(), static_cast<char *>(mapped) + (aligned - base) + 16, sizeof(bounds));
+    const std::array<float, 6> expected{0, 0, 0, 1, 1, 0};
+    std::printf("XDXR imported vertices: bounds=(%g,%g,%g)-(%g,%g,%g)\n", bounds[0], bounds[1], bounds[2],
+                bounds[3], bounds[4], bounds[5]);
+    return bounds == expected;
+}
 
 int run(vktest::Device &d, const char *shader) {
     VkPhysicalDeviceAccelerationStructurePropertiesKHR caps{
@@ -289,6 +331,7 @@ int run(vktest::Device &d, const char *shader) {
         desc.buffer = imported.buffer;
         desc.va = reinterpret_cast<uintptr_t>(imported.host);
         desc.host = static_cast<const uint8_t *>(imported.host);
+        set_import_address(desc, d.device_address(imported.buffer));
         ctx.add_resource(1, desc);
         entries[0] = desc.va;
         entries[1] = desc.va + 64;
@@ -296,6 +339,51 @@ int run(vktest::Device &d, const char *shader) {
         ctx.set_heap_base(heap_base);
         top.scratch_va = tlas.scratch - heap_base;
         external_pass = check("EXT host allocation, host-pointer VA");
+        top.instance_pointers = false;
+        top.instances_va = desc.va;
+        const bool contiguous = check("KHR contiguous imported descriptors");
+        top.instance_pointers = true;
+        top.instances_va = 0x30010;
+
+        HostBuffer vertices{d};
+        CHECK(vertices.create(mem));
+        void *shifted = nullptr;
+        auto alternate = d.buffer(128, input | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &shifted);
+        CHECK(alternate);
+        auto moved = coords;
+        for (size_t i = 0; i < moved.size(); i += 3)
+            moved[i] += 4;
+        std::memcpy(static_cast<char *>(vertices.host) + 16, coords.data(), sizeof(coords));
+        std::memcpy(static_cast<char *>(shifted) + 16, moved.data(), sizeof(moved));
+        ResourceBinding vb{};
+        vb.buffer = vertices.buffer;
+        vb.va = reinterpret_cast<uintptr_t>(vertices.host);
+        vb.size = 128;
+        set_import_address(vb, d.device_address(vb.buffer));
+        ctx.add_resource(4, vb);
+        const auto geometry_heap = d.device_address(alternate) - vb.va;
+        ctx.set_heap_base(geometry_heap);
+        auto short_alias = vb;
+        short_alias.buffer = alternate;
+        short_alias.va += 16;
+        short_alias.size = 8;
+        short_alias.buffer_offset = 16;
+        set_import_address(short_alias, d.device_address(alternate) + 16);
+        ctx.add_resource(5, short_alias);
+        b.triangles.front().vertex_va = vb.va + 16;
+        b.scratch_va = blas.scratch - geometry_heap;
+        top.scratch_va = tlas.scratch - geometry_heap;
+        CHECK(submit(b) == ReplayResult::success);
+        CHECK(d.run([&](auto cb) {
+            barrier(d, cb, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+            return true;
+        }));
+        const bool khr_vertices = check("KHR imported triangle vertices with short alias");
+        const bool xdxr_vertices = check_xdxr_vertices(d, vb, geometry_heap, b);
+        external_pass = external_pass && contiguous && khr_vertices && xdxr_vertices;
     } else {
         std::puts("EXT host allocation: skipped (coherent addressable import unavailable)");
     }

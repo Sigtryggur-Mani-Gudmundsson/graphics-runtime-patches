@@ -29,6 +29,12 @@ The Windows drawing guest and presenter measurements are in [windows-guest-frame
 
 The tenth commit fixes the optional KHR ray-tracing path. A short overlapping buffer could hide the CPU mapping for an instance pointer list. The queue also used the global arena base when translating descriptors in imported buffers. The new queue regression checks the staged Vulkan addresses, a short alias, an incomplete range, an unreadable list and a missing device address. It passed on Linux and as a Windows executable under Wine using a Vulkan test double. The final Linux CTest run passed 69 tests and skipped the same two listed above. A separate two-ray GPU test verified the KHR build on an RTX 4070 Ti, including a descriptor buffer imported from host memory. The Windows D3D12 shim changes remain unverified. [GPU test, results and reproduction instructions](tests/khr-instance-addresses/README.md)
 
+## Imported geometry in the default and KHR ray-tracing backends
+
+After the ten runtime commits, apply [direct-geometry.mbox](direct-geometry.mbox) with `git am /path/to/direct-geometry.mbox`. This patch applies independently of the archive-selection changes. It records the Vulkan device address for imported host memory and resolves direct ray-build inputs through their registered address ranges.
+
+With the same imported triangle, the default XDXR builder previously produced bounds from x=4 to x=5. The patched builder produced the supplied bounds from x=0 to x=1. The optional KHR path also recovered the expected ray hit for both imported vertices and a contiguous imported instance array. These are Linux RTX 4070 Ti measurements. [Hardware reproduction and results](tests/khr-instance-addresses/README.md)
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
