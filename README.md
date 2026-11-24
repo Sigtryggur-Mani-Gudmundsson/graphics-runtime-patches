@@ -115,6 +115,12 @@ Apply [vcc-tuple-recovery.mbox](vcc-tuple-recovery.mbox) with `git am` to the ba
 
 The original PR refused all six synthetic programs from real LLVM 19 listings. The follow-up validated all six under LLVM 19.1.7 and 23.1.5. Five programs produced the expected words on an RTX 4070 Ti under each toolchain. [Test, measurements and reproduction commands](tests/vcc-tuples/README.md)
 
+## LLVM 19 inline constants in pixel shader conversions
+
+[sdwa-inline-recovery.mbox](sdwa-inline-recovery.mbox) applies independently to the base commit. LLVM 19 can print an eight-byte signed or unsigned integer-to-half conversion as twelve bytes. The translator now recovers the inline value from the native shader and advances by the correct width.
+
+On an RTX 4070 Ti, the previously rejected LLVM 19 pixel shader matched the reference in all 4,096 pixels. LLVM 23 and the Python decoder produced the same pixels. Both versions of LLVM also passed the decoder parity suite after correcting the lane-selector spelling and null export operand. [GPU fixture, expected values and commands](tests/sdwa-inline/README.md)
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.

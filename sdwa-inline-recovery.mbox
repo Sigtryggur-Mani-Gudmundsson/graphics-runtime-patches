@@ -1,0 +1,194 @@
+From 583870520f5f07cab8e8000389f8b27e3fdaaf48 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 03:44:14 +0000
+Subject: [PATCH 1/2] Match permlane selector syntax and type null exports by
+ operand position
+
+
+diff --git a/tests/test_shader_ir.py b/tests/test_shader_ir.py
+index 0a680236665e2d54bb230097c0c58aa2d5b78abc..a52e7b013817cc0c5c80ebe587d3ec426b4afa8e 100644
+--- a/tests/test_shader_ir.py
++++ b/tests/test_shader_ir.py
+@@ -261,7 +261,9 @@ class ParseLineTests(unittest.TestCase):
+ 
+     def test_exp_null_off_target(self):
+         ins = shader_ir.parse_line("\texp null off, v0, v1, v2")
+-        self.assertEqual([a["t"] for a in ins["args"][:2]], ["null", "off"])
++        self.assertEqual(ins["args"][0], {"k": "target", "t": "null"})
++        self.assertEqual(ins["args"][1]["t"], "off")
++        self.assertEqual(shader_ir.parse_line("\ts_mov_b32 null, 0")["args"][0]["k"], "special")
+         self.assertEqual(len(ins["args"]), 5)
+ 
+     def test_sendmsg_commas_stay_in_one_operand(self):
+diff --git a/tools/rdna2_decode.py b/tools/rdna2_decode.py
+index 3ec83b5f9ef8f0b8a4cbd4d8ff30a65db4d517ab..9232eb32e0a21f4ba3868f12216cd78ba5a72c48 100644
+--- a/tools/rdna2_decode.py
++++ b/tools/rdna2_decode.py
+@@ -979,7 +979,10 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
+                     args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2)))
+             elif fn == "SRC2":
+                 args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
+-        if op_sel:
++        if name in ("v_permlane16_b32", "v_permlanex16_b32") and 0 < op_sel < 4:
++            # The two selector bits here mean fetch-inactive and bound-control.
++            mods.append(f"op_sel:[{op_sel & 1},{op_sel >> 1}]")
++        elif op_sel:
+             # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
+             nbits = nsrc if opc < 0x100 else (nsrc + 1)
+             bits = [(op_sel >> i) & 1 for i in range(nsrc)]
+diff --git a/tools/shader_ir.py b/tools/shader_ir.py
+index eee43a72ceea05cf9143da42be0db76899f10749..a007ec557ee9a0e2fbda13e87e76e11ac5ce065e 100644
+--- a/tools/shader_ir.py
++++ b/tools/shader_ir.py
+@@ -224,6 +224,8 @@ def parse_line(line):
+         # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
+         parts = parts[0].split() + parts[1:]
+     args = [operand(a) for a in parts]
++    if op == "exp" and parts and parts[0] == "null":
++        args[0] = {"k": "target", "t": "null"}
+     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
+                       "v_frexp_mant_f64", "v_frexp_exp_i32_f64", "v_ldexp_f64", "v_trunc_f64",
+                       "v_ceil_f64", "v_rndne_f64", "v_floor_f64")):
+
+From 09f46445e150cc2915925aca63cf18d9549d1ed8 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 03:47:04 +0000
+Subject: [PATCH 2/2] Recover the native SDWA inline float and instruction
+ width from LLVM 19 listings
+
+
+diff --git a/tests/semantic/test_printed_encoding.py b/tests/semantic/test_printed_encoding.py
+index 2664e9d2cb0e8604d1806162e4488bee200cf12f..73e32e6074908c7bf8ff8585ada5b3f8be730654 100644
+--- a/tests/semantic/test_printed_encoding.py
++++ b/tests/semantic/test_printed_encoding.py
+@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
+ if HERE not in sys.path:
+     sys.path.insert(0, HERE)
+ 
+-from support import rdna2spirv, translate_listing  # noqa: E402
++from support import mrt0_words, rdna2spirv, translate_listing  # noqa: E402
+ 
+ # llvm-mc -mcpu=gfx1013 -mattr=+wavefrontsize64 -show-encoding (LLVM 21.1.8).
+ PROGRAM = [
+@@ -60,6 +60,27 @@ class PrintedEncodingTest(unittest.TestCase):
+     def test_matching_blob_translates(self):
+         self.assertIn("OpEntryPoint Fragment", self.translate(listing(PROGRAM), blob(PROGRAM)))
+ 
++    def test_llvm19_sdwa_inline_float_uses_stored_width_and_operand(self):
++        # src0_sel:WORD_1 takes the high half of the inline constant's f32 bits.
++        # LLVM 19 prints it as a zero-extended half-precision literal and advances the listing by 12.
++        setup = ("v_mov_b32_e32 v5, 0xaaaa5555", "ff 02 0a 7e 55 55 aa aa")
++        export = ("exp mrt0 v5, v5, v5, v5 done vm", "0f 18 00 f8 05 05 05 05")
++        for op, opcode in (("u16", "a0"), ("i16", "a2")):
++            mods = "dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1"
++            native = (f"v_cvt_f16_{op}_sdwa v5, 1.0 {mods}", f"f9 {opcode} 0a 7e f2 14 85 00")
++            shown = (f"v_cvt_f16_{op}_sdwa v5, 0x3c00 {mods}", f"f9 {opcode} 0a 7e ff 14 85 00 00 3c 00 00")
++            stored = blob([setup, native, native, export, PROGRAM[-1]])
++            printed = listing([setup, shown, shown, export, PROGRAM[-1]], end=len(stored))
++            for tail in (b"", b"; warning: invalid instruction encoding\n"):
++                with self.subTest(op=op, reanchor=bool(tail)):
++                    self.assertEqual(mrt0_words(self.translate(printed + tail, stored)), [0xaaaa73f0] * 4)
++            # A different literal or a changed selection field is still a real mismatch.
++            for index, value in ((9, 0x40), (6, 0x84)):
++                different = listing(with_byte([setup, shown, shown, export, PROGRAM[-1]], 1, index, value),
++                                    end=len(stored))
++                with self.assertRaises(rdna2spirv.Unsupported):
++                    self.translate(different, stored)
++
+     def test_dropped_vopc_op_sel_is_refused(self):
+         # The blob holds v_cmp_lt_f16_e64 with op_sel:[1,0] (word 0 bit 11); LLVM printed it without.
+         stored = with_byte(PROGRAM, 0, 1, 0x08)
+diff --git a/tests/test_rdna2_decode.py b/tests/test_rdna2_decode.py
+index 9eede0d0d3ca816d8d450e5532d856c365f86a8a..54f4899791618b69b3ccd9d19ffb4c876c89a96b 100644
+--- a/tests/test_rdna2_decode.py
++++ b/tests/test_rdna2_decode.py
+@@ -393,11 +393,13 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
+             if r.returncode != 0 or "error:" in r.stderr:
+                 continue
+             raw = bytearray()
++            assembled = []
+             for ln in r.stdout.splitlines():
+                 if "; encoding:" not in ln or ln.lstrip().startswith("."):
+                     continue
+                 ins = shader_ir.parse_line(ln)
+                 if ins and ins["enc"]:
++                    assembled.append(ins)
+                     raw.extend(bytes.fromhex(ins["enc"]))
+             dcmd = [mc, "-disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
+             if mattr:
+@@ -416,7 +418,12 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
+             dec = rdna2_decode.decode_bytes(bytes(raw), wave32=wave32)
+             self.assertEqual(dec["invalid"], 0, path)
+             self.assertEqual(len(dec["insns"]), len(llvm_insns), path)
+-            for li, di in zip(llvm_insns, dec["insns"]):
++            self.assertEqual(len(assembled), len(llvm_insns), path)
++            for ai, li, di in zip(assembled, llvm_insns, dec["insns"]):
++                # LLVM 19 re-encodes this disassembly with a spurious literal. Its assembler
++                # prints the original operand, modifiers and eight bytes for the same instruction.
++                if rdna2spirv.sdwa_inline_float(bytes.fromhex(ai["enc"]), bytes.fromhex(li["enc"]), li["op"]):
++                    li = ai
+                 self.assertEqual(di["enc"], li["enc"], path)
+                 self.assertEqual(norm_op(di["op"]), norm_op(li["op"]), path)
+                 self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 3eb29576869b18dcf3fb722d8239ed00aeba94ee..8bb1fcb7a4458ab2b458b43783a77514daf0ef7f 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -16988,6 +16988,25 @@ MIX_INLINE_F16 = {**{0x80 + n: n for n in range(65)}, **{0xC0 + n: -n & 0xFFFF f
+                   0xF6: 0x4400, 0xF7: 0xC400, 0xF8: 0x3118}
+ 
+ 
++def sdwa_inline_float(raw, printed, op):
++    """LLVM 19 can print an integer-to-half SDWA conversion's inline float as an extra literal dword."""
++    if op not in ("v_cvt_f16_u16_sdwa", "v_cvt_f16_i16_sdwa") or len(printed) != 12 or len(raw) < 8:
++        return False
++    # Keep only the native VOP1 opcode and source marker when checking the first dword.
++    word = int.from_bytes(raw[:4], "little") & 0xfe01ffff
++    opcode = 0x7e00a0f9 if op == "v_cvt_f16_u16_sdwa" else 0x7e00a2f9
++    return (word == opcode and 0xf0 <= raw[4] <= 0xf8 and raw[6] & 0x80 and printed[4] == 0xff
++            and raw[:4] == printed[:4] and raw[5:8] == printed[5:8]
++            and int.from_bytes(printed[8:], "little") == MIX_INLINE_F16[raw[4]])
++
++
++def restore_sdwa_source(ins, raw):
++    import rdna2_decode
++    source, = rdna2_decode.decode_bytes(raw[:8])["insns"]
++    ins["args"][1] = source["args"][1]
++    ins["enc"] = raw[:8].hex()
++
++
+ def mix_inline_literal(raw, printed, op):
+     """The 32-bit literal of a v_fma_mix* that llvm-mc 21 printed as an inline constant, else None.
+ 
+@@ -17253,7 +17272,7 @@ def check_printed_encodings(path, info):
+     blob = native_blob(path, info["name"])
+     if int(m.group(3), 16) > len(blob):
+         return
+-    shift = 0        # bytes the decoder read past the printed encodings so far (mix_inline_literal)
++    shift = 0        # actual bytes consumed minus printed bytes consumed so far
+     for ins in info["insns"]:
+         ins["pc"] += shift
+         if not ins.get("enc"):
+@@ -17261,6 +17280,10 @@ def check_printed_encodings(path, info):
+         enc = bytes.fromhex(ins["enc"])
+         raw = blob[ins["pc"]:ins["pc"] + len(enc)]
+         if not same_encoding(raw, enc, ins["op"], len(ins["args"])):
++            if sdwa_inline_float(raw, enc, ins["op"]):
++                restore_sdwa_source(ins, raw)
++                shift -= 4
++                continue
+             literal = mix_literal(raw, enc, base_op(ins["op"]))
+             if literal is not None:
+                 restore_mix_literal(ins, raw, literal)
+@@ -17344,6 +17367,11 @@ def translate(path):
+                 if literal is not None:
+                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+                     break
++                raw8 = blob[at:at + 8]
++                if sdwa_inline_float(raw8, enc, op):
++                    restore_sdwa_source(ins, raw8)
++                    enc = raw8
++                    break
+                 literal = mix_inline_literal(blob[at:at + 12], enc, base_op(op))
+                 if literal is not None:
+                     restore_mix_inline_literal(ins, blob[at:at + 12], literal)
