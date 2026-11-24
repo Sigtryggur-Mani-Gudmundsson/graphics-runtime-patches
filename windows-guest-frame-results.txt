@@ -50,3 +50,24 @@ extent, with real Vulkan swapchain, synchronization and pixel readback.
 
 These fixtures exercise the loader, translated graphics and presentation.
 They do not establish the cause of a retail title's black screen.
+
+Capture diagnostics follow-up (2026-11-24, same GPU, Wine/XWayland)
+
+The presentation-status regression used the real queue and swapchain with
+a driver double overriding the present result. Before the fix a submitted
+blank frame remained readable after VK_ERROR_OUT_OF_DATE_KHR even though
+the presented counter did not advance. The fixed test verified false
+readback, unchanged caller outputs and successful full-colour readback on
+the next VK_SUBOPTIMAL_KHR present. The presenter sync suite passed.
+
+Three 128x96 synthetic captures used VK_FORMAT_B8G8R8A8_UNORM. A second
+check read the P6 bytes independently and counted pixels with any nonzero
+RGB channel. The black frame, one dim red pixel (1/255), and green frame
+had 0, 1 and 12288 such pixels respectively. The first two previously
+printed the same RGB mean to two decimal places. The patched index and
+stderr reported all three exact counts. PPM bytes matched the originals.
+For a run, set LEONIDA_CAPTURE to a fresh directory and
+LEONIDA_CAPTURE_EVERY=1. Each indexed sample includes nonzero_rgb_pixels.
+These counts describe the sampled swapchain image. Source rendering and
+the physical display require their own measurements. HDR10 hardware
+capture was not exercised in this run.

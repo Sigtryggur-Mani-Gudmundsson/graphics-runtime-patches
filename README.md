@@ -1,6 +1,6 @@
 # Graphics runtime patches
 
-Seven source and test commits for the Leonida compatibility runtime, based on `de4c37383cad386eaa851047628d7b92c51009c5`. The series includes Wine test registration, a Vulkan presentation fix, shader translation fixes, audio structure sizes, descriptor heap routing and regression tests. All GPU and audio results below use synthetic fixtures. Retail startup is unverified.
+Nine source and test commits for the Leonida compatibility runtime, based on `de4c37383cad386eaa851047628d7b92c51009c5`. The series includes Wine test registration, Vulkan presentation and capture fixes, shader translation fixes, audio structure sizes, descriptor heap routing and regression tests. All GPU and audio results below use synthetic fixtures. Retail startup is unverified.
 
 ## Apply the series
 
@@ -12,9 +12,11 @@ git am /path/to/runtime-fixes.mbox
 git rev-parse 'HEAD^{tree}'
 ```
 
-The verified source tree is `6e7b8c299510e70772e9caa49195cc1425047d71`. Applying the published series to the base reproduced this tree.
+The verified source tree is `42d7053bc0bfe2746d25e0aa8e4f9f646fd5b814`. Applying the published series to the base reproduced this tree.
 
-## Combined verification
+## Verification
+
+The first seven commits were tested together in the suites below. The two follow-up commits were tested in the source-built Windows presenter on Wine/XWayland. An injected out-of-date present invalidated readback, a suboptimal present retained it, and the captured pixel counts matched all three synthetic images.
 
 | Suite | Result |
 | --- | --- |

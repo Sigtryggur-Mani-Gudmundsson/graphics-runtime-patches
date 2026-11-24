@@ -1,7 +1,7 @@
 From 0fa0a0c49d0a501bc1ab3c273f7b5a8f52c885be Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:35:52 +0000
-Subject: [PATCH 1/7] test: run the translated draw guest through CTest on Wine
+Subject: [PATCH 1/9] test: run the translated draw guest through CTest on Wine
 
 
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
@@ -83,7 +83,7 @@ index b6584e3784407b00c7a9a266004796dfea3b2659..bbee1851169a04e38402998965a62bbe
 From a8b1419fec6dbe0c634773cbf2407df1bec1189c Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:35:52 +0000
-Subject: [PATCH 2/7] fix: skip presentation for a measured zero client extent
+Subject: [PATCH 2/9] fix: skip presentation for a measured zero client extent
 
 
 diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
@@ -197,7 +197,7 @@ index a54bf6662ce6ff096ac3a6977f7a7a887bbfc86b..b3db4927cd24b5ef6ee952116fd65932
 From cc5e050eca34568e4c44c98fb72fdb53e54c6d1f Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:37:30 +0000
-Subject: [PATCH 3/7] fix: restore verified EXEC, mesh and image-load
+Subject: [PATCH 3/9] fix: restore verified EXEC, mesh and image-load
  translations
 
 Backported from simomistralii/Leonida-PC PR 2, original commits by Claude: 65d5201fd3927551574af221022fc6ec64a783c1, ad0fb49cbbae399a2305a19566c1959d4bcba4e5 and 14e2312774700a09b5746d1f479170c531f74842.
@@ -472,7 +472,7 @@ index 74d37961f6529f253eab6aa8741b235d95ca40ed..79ef42ea12419c237fd28430218dcd1c
 From 7b8b4bea60cfae50564b82716febae20c1e9f38f Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:31 +0000
-Subject: [PATCH 4/7] fix: restore hardware audio context sizes
+Subject: [PATCH 4/9] fix: restore hardware audio context sizes
 
 Source: luizwidmer/Leonida-work at 7d61424381ea69e7422cd98e13ee2b682a58d055. Includes the original padding changes and comments.
 
@@ -504,7 +504,7 @@ index 553f57f2072a619a8b7e7f0deeeb0ad3fd4f6b32..02dc650575e3c73c580ca75faac86762
 From 28cd1ce7d2797dc1d8865fd7961f590af790eddf Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:31 +0000
-Subject: [PATCH 5/7] fix: route addressed descriptor heaps through their
+Subject: [PATCH 5/9] fix: route addressed descriptor heaps through their
  device
 
 Builds on the slot 14 routing and test in Vyzerythe/Leonida PR 12. The per-device callback and COM ownership checks are local changes.
@@ -783,7 +783,7 @@ index 5f694b5a2a22fced351ecfac89701435023d14ba..d588cbff8f0366829158cf10cd75ecb1
 From 21e0f27001be96e6953c35a13d3cc595e5002a42 Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:31 +0000
-Subject: [PATCH 6/7] test: restore image atomic guard coverage for nested
+Subject: [PATCH 6/9] test: restore image atomic guard coverage for nested
  regions
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -985,7 +985,7 @@ index c769038bbf9e334b889e47489ca8f4ecf7cd488c..5ed1cf121ee343be01adcf5223347969
 From 02b5c8b3e4e946c7f77ed3b3e6cd55c8d670544f Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:55 +0000
-Subject: [PATCH 7/7] test: check true edges when verifying image atomic guards
+Subject: [PATCH 7/9] test: check true edges when verifying image atomic guards
 
 
 diff --git a/tests/semantic/test_image_atomics_guard.py b/tests/semantic/test_image_atomics_guard.py
@@ -1101,3 +1101,187 @@ index 5ed1cf121ee343be01adcf52233479699a9fd133..b5c117c89f4351f32ca0fd2ba057e046
      def test_nested_cas_loop_remains_inside_active_guard(self):
          spv = """
  %entry = OpLabel
+
+From 0d1ba0fe9819aff48d3d6105e23dcc1557826d9b Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:47:13 +0000
+Subject: [PATCH 8/9] fix: expose readback only for accepted swapchain images
+
+
+diff --git a/runtime/src/vulkan_present.h b/runtime/src/vulkan_present.h
+index dc7dd10bccd00f856fccdf806dc16f16fec4a850..4983f11e1f603c9bd89b22ee07202c200651ccca 100644
+--- a/runtime/src/vulkan_present.h
++++ b/runtime/src/vulkan_present.h
+@@ -351,7 +351,7 @@ public:
+ 
+     // The last presented frame as the swapchain stores it (4 bytes a texel, rows tightly packed, format() order).
+     // Waits for the frame to finish. False when nothing was presented since enable_capture(), after a present
+-    // that was skipped because the window is minimised (it returned VK_SUCCESS but showed nothing), until the next
++    // skipped for a minimised window or rejected by the presentation engine, until the next
+     // frame that is shown (the frame before it is not what the window was last asked to show), or when the wait fails.
+     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format) {
+         std::lock_guard lock(present_mutex_);
+@@ -615,6 +615,7 @@ private:
+         }
+         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
+         ++frame_index_;
++        captured_ = false;  // the submitted copy overwrote the staging buffer
+         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
+         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
+         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+@@ -627,11 +628,11 @@ private:
+             if (capture_to_disk_ && capture_ && capture_ptr_ && capture_written_ < capture_limit_ &&
+                 (presented_ - 1) % std::uint64_t(capture_every_) == 0)
+                 pending_capture_ = frame.done;
+-        }
+-        if (capture_ && capture_ptr_) {
+-            captured_ = true;
+-            captured_extent_ = extent_;
+-            captured_format_ = format_;
++            if (capture_ && capture_ptr_) {
++                captured_ = true;
++                captured_extent_ = extent_;
++                captured_format_ = format_;
++            }
+         }
+         if (result == VK_ERROR_SURFACE_LOST_KHR) {
+             // The surface was lost during the present (display disconnected, a driver reset of the window's
+diff --git a/runtime/test/vk_presenter_sync_test.cpp b/runtime/test/vk_presenter_sync_test.cpp
+index b3db4927cd24b5ef6ee952116fd65932600d6359..5abe0d41b6434ccd29bc3e4c8cb4599c615ff867 100644
+--- a/runtime/test/vk_presenter_sync_test.cpp
++++ b/runtime/test/vk_presenter_sync_test.cpp
+@@ -67,6 +67,7 @@ PFN_vkDeviceWaitIdle real_device_wait_idle = nullptr;
+ 
+ std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
+ std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
++std::atomic<VkResult> next_present_status{VK_SUCCESS};
+ std::function<void()> on_next_present;
+ std::atomic<bool> observe_capture{false};
+ std::atomic<bool> saw_capture_waw{false};
+@@ -113,7 +114,8 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoK
+         on_next_present = {};
+         cb();
+     }
+-    return real_present(queue, info);
++    const VkResult result = real_present(queue, info);
++    return result == VK_SUCCESS ? next_present_status.exchange(VK_SUCCESS) : result;
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice device, std::uint32_t count, const VkFence* fences,
+@@ -380,6 +382,24 @@ int main() {
+         EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
+         driver::undefined_surface_extent = false;
+ 
++        // Queue submission fills the staging buffer before the presentation engine returns
++        // its status. A rejected blank frame must not be exposed as the displayed image.
++        const auto before_rejection = presenter.presented();
++        driver::next_present_status = VK_ERROR_OUT_OF_DATE_KHR;
++        EXPECT(presenter.present_blank(true) == VK_SUCCESS);
++        EXPECT(presenter.presented() == before_rejection);
++        pixels = {0x7f};
++        ext = {7, 9};
++        fmt = VK_FORMAT_UNDEFINED;
++        EXPECT(!presenter.read_back(pixels, &ext, &fmt));
++        EXPECT(pixels.size() == 1 && pixels[0] == 0x7f);
++        EXPECT(ext.width == 7 && ext.height == 9 && fmt == VK_FORMAT_UNDEFINED);
++        driver::next_present_status = VK_SUBOPTIMAL_KHR;
++        EXPECT(presenter.present(1, true) == VK_SUCCESS);
++        EXPECT(presenter.presented() == before_rejection + 1);
++        EXPECT(presenter.read_back(pixels, &ext, &fmt));
++        EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
++
+         // 2b. A Present behind held work shows what that work draws (queue_holds.h). The render waits for a gate with
+         //     no submitted Signal, so the queue holds it; the presents are queued behind it instead of blitting the
+         //     back buffers as they were. Three presents queue up and keep their order: a blit, a blank one (reads
+
+From 710b8f900fe7c6c89cb55298ca4a1b58e96ad6bd Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:48:15 +0000
+Subject: [PATCH 9/9] feat: report exact nonzero RGB pixel count in frame
+ captures
+
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 0652c6c8755353681b83eb086a2156de7504a47e..8d2c4357ca57d140fa7aacd2f92c545e85b0b5b9 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -3166,11 +3166,11 @@ queue they came on (one `VkQueue` behind all of them).
+   out gives `E_INVALIDARG` (nothing presented). Skipping a token is fine.
+ - *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
+   every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
+-  converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
+-  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
+-  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
+-  mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
+-  the colour it clears to.
++  converted to 8-bit RGB, and appends its extent, mean RGB and `nonzero_rgb_pixels` to `<dir>/index.txt`. The count
++  measures pixels with any nonzero RGB component in the swapchain's native format, ignoring alpha. Zero means that
++  every captured RGB component was zero. A sparse frame can have a positive count even when all three printed
++  means round to zero. Capture is opt-in and creates the output folder. `d3d12_present_test` checks the files
++  against the colour it clears to.
+ - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
+   with `ERROR_INVALID_STATE` and refuses presents (a `PresentX` waiting for a swapchain image polls the suspended
+   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
+diff --git a/runtime/src/vulkan_present.h b/runtime/src/vulkan_present.h
+index 4983f11e1f603c9bd89b22ee07202c200651ccca..8dcb966551e273edd51b445dc018b88961da03f8 100644
+--- a/runtime/src/vulkan_present.h
++++ b/runtime/src/vulkan_present.h
+@@ -1065,6 +1065,7 @@ private:
+         if (!capture_ptr_ || !texels || texels > capture_size_ / 4) return;
+         std::vector<std::uint8_t> rgb(texels * 3);
+         std::uint64_t sum[3] = {0, 0, 0};
++        std::size_t nonzero_rgb_pixels = 0;
+         const std::uint8_t* src = capture_ptr_;
+         switch (format) {
+         case VK_FORMAT_B8G8R8A8_UNORM:
+@@ -1074,6 +1075,7 @@ private:
+                 rgb[i * 3 + 0] = r;
+                 rgb[i * 3 + 1] = g;
+                 rgb[i * 3 + 2] = b;
++                nonzero_rgb_pixels += (r | g | b) != 0;
+                 sum[0] += r;
+                 sum[1] += g;
+                 sum[2] += b;
+@@ -1086,6 +1088,7 @@ private:
+                 rgb[i * 3 + 0] = r;
+                 rgb[i * 3 + 1] = g;
+                 rgb[i * 3 + 2] = b;
++                nonzero_rgb_pixels += (r | g | b) != 0;
+                 sum[0] += r;
+                 sum[1] += g;
+                 sum[2] += b;
+@@ -1103,6 +1106,7 @@ private:
+                 rgb[i * 3 + 0] = r;
+                 rgb[i * 3 + 1] = g;
+                 rgb[i * 3 + 2] = b;
++                nonzero_rgb_pixels += (low | mid | high) != 0;  // before 10-to-8-bit conversion
+                 sum[0] += r;
+                 sum[1] += g;
+                 sum[2] += b;
+@@ -1132,10 +1136,11 @@ private:
+         if (index)
+             index << "frame " << number << " format " << int(format) << " (" << capture_format_name(format)
+                   << ") extent " << extent.width << 'x' << extent.height << " mean rgb " << std::fixed
+-                  << std::setprecision(2) << mean[0] << ' ' << mean[1] << ' ' << mean[2] << '\n';
++                  << std::setprecision(2) << mean[0] << ' ' << mean[1] << ' ' << mean[2]
++                  << " nonzero_rgb_pixels " << nonzero_rgb_pixels << '\n';
+         ++capture_written_;
+-        std::fprintf(stderr, "[rt] present: capture %s (%ux%u, mean rgb %.2f %.2f %.2f)\n", name, extent.width,
+-                     extent.height, mean[0], mean[1], mean[2]);
++        std::fprintf(stderr, "[rt] present: capture %s (%ux%u, mean rgb %.2f %.2f %.2f, nonzero_rgb_pixels %zu)\n",
++                     name, extent.width, extent.height, mean[0], mean[1], mean[2], nonzero_rgb_pixels);
+     }
+ 
+     // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
+diff --git a/runtime/test/d3d12_present_test.cpp b/runtime/test/d3d12_present_test.cpp
+index 5c626ea80b47f1acf3e489b723e70793fc88f5b1..43f164c591dd0e787899750127f93d655c72c643 100644
+--- a/runtime/test/d3d12_present_test.cpp
++++ b/runtime/test/d3d12_present_test.cpp
+@@ -681,6 +681,7 @@ int main() {
+                 ++lines;
+                 const bool red = lines % 2 == 1;
+                 if (line.starts_with("frame " + std::to_string(lines) + " ") &&
++                    line.ends_with(" nonzero_rgb_pixels " + std::to_string(width * height)) &&
+                     std::fabs(r - (red ? 255 : 51)) <= 3.0 && std::fabs(g - (red ? 0 : 153)) <= 3.0 &&
+                     std::fabs(b - (red ? 0 : 230)) <= 3.0) ++matching;
+             }
