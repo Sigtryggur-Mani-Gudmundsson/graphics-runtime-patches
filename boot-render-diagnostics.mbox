@@ -1,0 +1,243 @@
+From 1d4762088e3a295359d584a60d5dc61dec7a2dae Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 02:40:07 +0000
+Subject: [PATCH] Report shader lookup failures and measured frame colors in
+ boot traces
+
+
+diff --git a/docs/boot.md b/docs/boot.md
+index 7ec69f0314934c05c62ba643d46a5a98f7af1161..6e051b9129036d74edfc9151e88d0c00697ff8eb 100644
+--- a/docs/boot.md
++++ b/docs/boot.md
+@@ -28,8 +28,15 @@ Two traces are written independently:
+ 
+ `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
+ DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
+-per method. The `[rt]` lines in the same stderr log carry the device parameters, feature ids and warnings; the
+-summary leaves them as a count, so grep `^\[rt\]` for those.
++per method. The same report counts shader translation lookup failures by stage. For builds with
++`LEONIDA_STUB_PIPELINES`, the highest logged creation milestone gives a lower bound on stub pipelines created.
++The runtime can create a pipeline without ever drawing with it.
++
++If the presenter logged capture measurements, the report counts black and nonblack readbacks.
++On older builds, a positive mean establishes color, while three rounded zero means leave the capture
++inconclusive. A successful `PresentX` call alone gives no pixel measurement. To share just the counters,
++run `python -I tools/boot_trace.py --d3d12 d3d12.log --counts-only`. For device parameters, feature IDs
++and other warnings, inspect the original stderr locally.
+ 
+ ## 2. Commands
+ 
+diff --git a/tests/test_boot_trace.py b/tests/test_boot_trace.py
+index e68f162f8d555395acb7f7739592f9432c2b6611..3d39a4b42bdb6013390858a09cfad30aa273348e 100644
+--- a/tests/test_boot_trace.py
++++ b/tests/test_boot_trace.py
+@@ -352,7 +352,7 @@ class BootTraceTests(unittest.TestCase):
+         self.assertIn("refused: #6 MapTiles", text)
+         self.assertIn("#5 SetMarker/BeginEvent with unknown metadata", text)
+         self.assertIn("ID3D12CommandQueue::ExecuteCommandLists", text)
+-        self.assertIn("[rt] diagnostics are not summarized", text)
++        self.assertIn("1 other line(s)", text)
+         self.assertNotIn("sequence breaks", text)
+ 
+     def test_partial_submissions_are_named_in_text_and_json(self):
+@@ -413,6 +413,53 @@ class BootTraceTests(unittest.TestCase):
+         self.assertEqual(data["d3d12"]["outcomes"], {"failed": 1, "other": 1})
+         self.assertEqual(data["d3d12"]["calls"], 2)
+ 
++    def test_render_log_without_call_tracing(self):
++        capture = "[rt] present: capture frame_00001.ppm (128x96, mean rgb "
++        self.write_lines(self.d3d12, [
++            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 0)",
++            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 1)",
++            capture + "0.00 0.00 0.00)",
++            capture + "0.00 255.00 0.00)",
++            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 12289)",
++            capture + "0.00 0.00 0.00, nonzero_rgb_pixels 0",  # truncated
++        ])
++        trace = bt.parse_d3d12(self.d3d12)
++        self.assertEqual(trace["calls"], 0)
++        self.assertNotIn("last_call", trace)
++        self.assertEqual(trace["ignored_lines"], 2)
++        self.assertEqual(trace["render"], {
++            "black_captures": 1, "nonblack_captures": 2, "inconclusive_captures": 1,
++        })
++
++    def test_shader_diagnostics_and_calls_share_a_log(self):
++        stub = "[rt] d3d12: LEONIDA_STUB_PIPELINES: {} pipeline without a translated shader is a no-op stub ({} so far)"
++        digest = "abc0" * 16
++        with open(self.d3d12, "w", encoding="utf-16", newline="\r\n") as log:
++            log.write("\n".join([
++                "private.exe : [rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv",
++                f"[rt] d3d12: no translated vs for FSSM sha256 {digest}",
++                f"[rt] d3d12: no translated compute shader for FSPX kind-6 and kind-0 sha256 {digest}",
++                f"[rt] d3d12: no translated compute shader for FSSM sha256 {digest}",
++                stub.format("graphics", 1), stub.format("compute", 8), stub.format("graphics", 4),
++                f"[rt] d3d12: no translated private-stage for FSSM sha256 {digest}",
++                "[d3d12-trace] #1 PresentX ok",
++            ]))
++        out = io.StringIO()
++        with contextlib.redirect_stdout(out):
++            self.assertEqual(bt.main(["--d3d12", self.d3d12, "--counts-only"]), 0)
++        counters = json.loads(out.getvalue())["d3d12"]
++        self.assertEqual(counters["calls"], 1)
++        self.assertEqual(counters["ignored_lines"], 1)
++        self.assertEqual(counters["render"], {
++            "shader_directory_unset_messages": 1, "missing_vs_messages": 1, "missing_cs_messages": 2,
++            "stub_pipelines_at_least": 8,
++        })
++        self.assertNotIn(digest, out.getvalue())
++        self.assertNotIn("private", out.getvalue())
++        text = bt.format_text(bt.summarize(None, bt.parse_d3d12(self.d3d12)), 10)
++        self.assertIn("at least 8 stub pipelines created", text)
++        self.assertIn("last recorded call: #1 PresentX ok", text)
++
+     def test_counts_only_redacts_missing_input_paths_from_stderr(self):
+         err = io.StringIO()
+         with contextlib.redirect_stderr(err):
+diff --git a/tools/boot_trace.py b/tools/boot_trace.py
+index 676ae206005271ff6f91e73d9b3143e64e541a9f..73cf1290a6e9b6e14da683f87ee33c50ea30f44a 100644
+--- a/tools/boot_trace.py
++++ b/tools/boot_trace.py
+@@ -4,7 +4,8 @@ The loader writes the startup trace with `gta6rt --trace FILE` (one JSON object
+ survives a crash; `runtime/README.md`, "Startup trace"), and the D3D12 proxy writes one `[d3d12-trace] #<seq>
+ <method> <outcome>` line to stderr with `--trace-d3d12`. This tool turns both into the small report a first-boot
+ triage needs: modules, unimplemented calls and their callers, DllMain/TLS results, exceptions and the exit, then
+-the D3D12 calls by outcome and the first call per method.
++the D3D12 calls by outcome and the first call per method. The stderr summary also recognizes missing shader
++translations, stub pipeline creation milestones and presenter readback measurements when the runtime emits them.
+ 
+ The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
+ outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
+@@ -34,6 +35,18 @@ import sys
+ D3D12_LINE = re.compile(r"^(?:.+ : )?\[d3d12-trace\] #(\d+) (.+) (\S+)\s*$")
+ D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
+ D3D12_OUTCOMES = frozenset((*D3D12_PROBLEMS, "called", "ok", "ignored"))
++CAPTURE_LINE = re.compile(
++    r"\[rt\] present: capture frame_[0-9]{5,20}\.ppm \(([1-9][0-9]{0,9})x([1-9][0-9]{0,9}), mean rgb "
++    r"([0-9]{1,3}\.\d{2}) ([0-9]{1,3}\.\d{2}) ([0-9]{1,3}\.\d{2})(?:, nonzero_rgb_pixels ([0-9]{1,20}))?\)"
++)
++SHADER_MISS = re.compile(
++    r"\[rt\] d3d12: no translated (?:(vs|gs|ps|ms) for FSSM|compute shader for "
++    r"(?:FSSM|FSPX kind-6(?: and kind-0)?)) sha256 [0-9a-f]{64}"
++)
++STUB_MILESTONE = re.compile(
++    r"\[rt\] d3d12: LEONIDA_STUB_PIPELINES: (?:graphics|compute) pipeline without a translated shader "
++    r"is a no-op stub \(([1-9][0-9]{0,9}) so far\)"
++)
+ 
+ 
+ class TraceError(ValueError):
+@@ -174,8 +187,43 @@ def parse_startup(path: str, limit: int = 10) -> dict:
+     return trace
+ 
+ 
++def _record_render(line: str, counts: dict) -> bool:
++    """Record only measurements and fixed categories emitted by the render diagnostics."""
++    if not line.startswith("[rt] "):
++        _, _, line = line.partition(" : ")  # PowerShell native stderr prefix
++    if match := CAPTURE_LINE.fullmatch(line):
++        width, height, red, green, blue, pixels = match.groups()
++        peak = max(float(red), float(green), float(blue))
++        if peak > 255:
++            return False
++        if pixels is None:
++            # Legacy means are rounded to two decimals. Sparse color can round to zero.
++            key = "nonblack_captures" if peak else "inconclusive_captures"
++        else:
++            nonzero = int(pixels)
++            if nonzero > int(width) * int(height) or (not nonzero and peak):
++                return False
++            key = "nonblack_captures" if nonzero else "black_captures"
++    elif match := SHADER_MISS.fullmatch(line):
++        key = f"missing_{match.group(1) or 'cs'}_messages"
++    elif line == "[rt] d3d12: no translated shaders: set LEONIDA_SHADERS to <work>/shaders/spirv":
++        key = "shader_directory_unset_messages"
++    elif match := STUB_MILESTONE.fullmatch(line):
++        # The diagnostic shares one counter across graphics/compute and logs powers of two.
++        n = int(match.group(1))
++        if n & (n - 1):
++            return False
++        key = "stub_pipelines_at_least"
++        counts[key] = max(counts.get(key, 0), n)
++        return True
++    else:
++        return False
++    counts[key] = counts.get(key, 0) + 1
++    return True
++
++
+ def parse_d3d12(path: str, limit: int = 10) -> dict:
+-    """Read the `--trace-d3d12` stderr lines, ignoring the runtime's ordinary diagnostics."""
++    """Read the runtime's D3D12 call trace and rendering diagnostics from stderr."""
+     trace = {
+         "path": path,
+         "calls": 0,
+@@ -192,13 +240,15 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
+         "sequence_break_count": 0,
+         "sequence_breaks": [],
+     }
++    render = {}
+     with _open_text(path) as fh:
+         for line in fh:
+-            match = D3D12_LINE.match(line.rstrip("\n"))
++            record = line.rstrip("\n")
++            match = D3D12_LINE.match(record)
+             # A crash can truncate the final outcome. A known complete outcome is
+             # still usable when the trace ends just before the newline.
+             if not match or (not line.endswith("\n") and match.group(3) not in D3D12_OUTCOMES):
+-                if line.strip():
++                if line.strip() and not _record_render(record, render):
+                     trace["ignored_lines"] += 1
+                 continue
+             seq, method, outcome = int(match.group(1)), match.group(2), match.group(3)
+@@ -219,12 +269,15 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
+                 bucket = trace[outcome]
+                 if len(bucket) < limit:
+                     bucket.append({"seq": seq, "method": method})
+-    if trace["calls"] == 0:
++    if render:
++        trace["render"] = render
++    if trace["calls"]:
++        trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
++    elif not render:
+         raise TraceError(
+             f"{path} has no [d3d12-trace] line among {trace['ignored_lines']} line(s); "
+             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
+         )
+-    trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
+     return trace
+ 
+ 
+@@ -258,6 +311,8 @@ def counts_only(summary: dict) -> dict:
+             "sequence_break_count": d3d12["sequence_break_count"],
+             "outcomes": outcomes,
+         }
++        if "render" in d3d12:
++            counters["d3d12"]["render"] = d3d12["render"]
+     return counters
+ 
+ 
+@@ -341,9 +396,13 @@ def format_text(summary: dict, limit: int) -> str:
+         outcomes = ", ".join(f"{k} {v}" for k, v in sorted(d3d12["outcomes"].items()))
+         out.append(
+             f"  {d3d12['calls']} call(s), {d3d12['ignored_lines']} other line(s)"
+-            " (the [rt] diagnostics are not summarized)"
+             + (f": {outcomes}" if outcomes else "")
+         )
++        for key, count in sorted(d3d12.get("render", {}).items()):
++            if key == "stub_pipelines_at_least":
++                out.append(f"  at least {count} stub pipelines created")
++            else:
++                out.append(f"  {key.replace('_', ' ')}: {count}")
+         if last_call := d3d12.get("last_call"):
+             out.append(f"  last recorded call: #{last_call['seq']} {last_call['method']} {last_call['outcome']}")
+         if d3d12["sequence_break_count"]:
+@@ -381,7 +440,7 @@ def main(argv=None) -> int:
+         description="Summarize gta6rt's startup and D3D12 first-boot traces."
+     )
+     ap.add_argument("startup", nargs="?", help="the JSONL written by gta6rt --trace")
+-    ap.add_argument("--d3d12", help="the stderr log written with --trace-d3d12")
++    ap.add_argument("--d3d12", help="runtime stderr with D3D12 calls or rendering diagnostics")
+     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
+     ap.add_argument("--counts-only", action="store_true", help="print aggregate JSON without paths or event details")
+     ap.add_argument(

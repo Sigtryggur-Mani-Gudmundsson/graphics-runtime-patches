@@ -49,6 +49,14 @@ XDXR previously treated a top-level instance pointer list as a packed array of d
 
 Linux and the cross-compiled Windows test under Wine used an RTX 4070 Ti. All 3,000 patched ray results matched the brute-force reference on each platform. To reproduce on Linux, build the runtime tests and run `ctest -R '^xdxr_build(_check)?$' --output-on-failure` in the build directory. The generator uses synthetic inputs and the checker compares GPU output with CPU traversal. Retail startup remains unverified.
 
+## Reading black-frame and missing-shader evidence from a boot log
+
+Apply [boot-render-diagnostics.mbox](boot-render-diagnostics.mbox) with `git am /path/to/boot-render-diagnostics.mbox`. It applies independently to the original source at `de4c37383cad386eaa851047628d7b92c51009c5`. A clean replay produced tree `3da5e874c3c0afb6a51426a347531555e8d712c3` and passed 42 trace, wrapper, and documentation tests.
+
+Run `python -I tools/boot_trace.py --d3d12 d3d12.log --counts-only` to share aggregate measurements. The parser recognizes lookup failures by shader stage and the stub creation milestones from rafaelpssz’s restoration of the diagnostic switch. Each milestone gives a lower bound across graphics and compute. The log cannot establish how many draws used those stubs. [ubiquitarianism/leonida PR 42](https://github.com/ubiquitarianism/leonida/pull/42)
+
+On the saved Windows synthetic presenter run, the parser found one fully black capture and two with color, including the single-pixel frame. With the older rounded-mean output it reported one capture with color and two inconclusive captures. These counts describe the presenter readback in that run. The retail black-screen cause remains open.
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
