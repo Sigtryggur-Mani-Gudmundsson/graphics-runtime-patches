@@ -1,0 +1,45 @@
+--- vk_test_device.h
++++ khr_test_device.h
+@@ -116,6 +116,7 @@
+     bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
+     bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
+     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
++    bool acceleration_structure = false;
+     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
+     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
+     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
+@@ -515,6 +516,22 @@
+             }
+         }
+ #endif
++        const auto has_ext = [&](const char* name) {
++            return std::any_of(extensions.begin(), extensions.end(), [&](auto& e){return std::strcmp(name, e.extensionName) == 0;});
++        };
++        VkPhysicalDeviceRayQueryFeaturesKHR rq{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
++        VkPhysicalDeviceAccelerationStructureFeaturesKHR as{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR, &rq};
++        if (has_ext(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) && has_ext(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) && has_ext(VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
++            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as};
++            features2_of(physical, &query);
++            acceleration_structure = as.accelerationStructure && rq.rayQuery;
++            if (acceleration_structure) {
++                as = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR, &rq};
++                as.accelerationStructure = VK_TRUE;
++                rq.pNext = *v13_.next();
++                *v13_.next() = &as;
++            }
++        }
+         // VK_EXT_mesh_shader (meshShader only), for the tests that ask for it.
+         VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+         if (request_mesh_shader && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+@@ -605,6 +622,11 @@
+         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+ #endif
+         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
++        if (acceleration_structure) {
++            device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
++            device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
++            device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
++        }
+         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
+         device_info.ppEnabledExtensionNames = device_extensions.data();
