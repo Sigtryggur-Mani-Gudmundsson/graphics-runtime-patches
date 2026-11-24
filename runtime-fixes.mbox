@@ -1,0 +1,1103 @@
+From 0fa0a0c49d0a501bc1ab3c273f7b5a8f52c885be Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:35:52 +0000
+Subject: [PATCH 1/7] test: run the translated draw guest through CTest on Wine
+
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index f317958f12c07287f47c83a19e00fd5fc0bc06cc..eb308b9af9355d0dfb21eb08859917eaba115d7d 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -3132,11 +3132,17 @@ if(TARGET Vulkan::Headers)
+       endif()
+       # This guest can use a synthetic fixture produced on another machine. Register the automated test
+       # if the tools to generate the fixture are available locally.
+-      if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING AND TARGET d3d12_translated_draw_test AND TARGET gta6rt)
++      set(_guest_draw_runner)
++      if(CMAKE_HOST_UNIX AND CMAKE_CROSSCOMPILING)
++        set(_guest_draw_runner ${CMAKE_CROSSCOMPILING_EMULATOR})
++      endif()
++      if(((CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING) OR _guest_draw_runner)
++         AND TARGET d3d12_translated_draw_test AND TARGET gta6rt)
+         add_dependencies(tiny_guest_draw d3d12_translated_draw_test gta6rt)
+         add_test(NAME d3d12_translated_draw_guest
+                  COMMAND ${CMAKE_COMMAND} -DGTA6RT=$<TARGET_FILE:gta6rt> -DGUEST=$<TARGET_FILE:tiny_guest_draw>
+-                         -DFIXTURE=${LEONIDA_M15_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_draw.cmake)
++                         -DFIXTURE=${LEONIDA_M15_DIR} "-DRUNNER=${_guest_draw_runner}"
++                         -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_draw.cmake)
+         set_tests_properties(d3d12_translated_draw_guest PROPERTIES TIMEOUT 180)
+       else()
+         message(STATUS "tiny_guest_draw will build. For an external synthetic M1.5 fixture or Wine run see runtime/README.md.")
+diff --git a/runtime/README.md b/runtime/README.md
+index 61794a2c2d38a83dd69da57805a40e9c526d4530..21d11119708979afd642356314f631eb060ff46d 100644
+--- a/runtime/README.md
++++ b/runtime/README.md
+@@ -590,6 +590,8 @@ $env:LEONIDA_VK_VALIDATION = '1'
+ On a Windows Vulkan build, configure CMake with `-DLEONIDA_TEST_GUEST_DRAW=ON` and build the
+ `tiny_guest_draw` and `gta6rt` targets. With llvm-mc, spirv-as and spirv-val available at configure
+ time, run `ctest --test-dir runtime/build -C Release -R "^d3d12_translated_draw_guest$" -V`.
++For a Unix-to-Windows cross-build, configure with `-DCMAKE_CROSSCOMPILING_EMULATOR=wine`
++and run the same CTest command with the Wine prefix that can access the build tree.
+ The loader maps the test executable. It imports the Xbox device factory, submits three draws using two
+ handwritten shaders, reads back a 64×64 offscreen texture and checks every pixel.
+ 
+diff --git a/runtime/test/run_guest_draw.cmake b/runtime/test/run_guest_draw.cmake
+index b6584e3784407b00c7a9a266004796dfea3b2659..bbee1851169a04e38402998965a62bbe19b03bf8 100644
+--- a/runtime/test/run_guest_draw.cmake
++++ b/runtime/test/run_guest_draw.cmake
+@@ -24,16 +24,28 @@ endforeach()
+ # The line test/d3d12_translated_draw_test.cpp prints under LEONIDA_M15_GUEST once every check has passed.
+ set(marker "M1.5 guest: PASS, 4064 of 4096 pixels exact, 32 edge pixels the clear colour")
+ 
+-file(TO_NATIVE_PATH "${GUEST}" guest)
+-file(TO_NATIVE_PATH "${FIXTURE}" fixture)
+-file(TO_NATIVE_PATH "${FIXTURE}/spirv" shaders)
+ get_filename_component(guest_dir "${GUEST}" DIRECTORY)
+-# Set here rather than as the test's ENVIRONMENT, before starting gta6rt on native Windows.
++if(RUNNER)
++  # The guest starts in its own directory. Resolve the fixture using the
++  # same Wine prefix and drive mappings as the loader, including wrapper arguments.
++  get_filename_component(guest "${GUEST}" NAME)
++  execute_process(COMMAND ${RUNNER} winepath.exe -w "${FIXTURE}"
++                  TIMEOUT ${TIMEOUT} RESULT_VARIABLE path_status OUTPUT_VARIABLE fixture
++                  OUTPUT_STRIP_TRAILING_WHITESPACE)
++  if(NOT "${path_status}" STREQUAL "0" OR fixture STREQUAL "")
++    message(FATAL_ERROR "winepath failed to resolve ${FIXTURE} (exit ${path_status})")
++  endif()
++  set(shaders "${fixture}\\spirv")
++else()
++  file(TO_NATIVE_PATH "${GUEST}" guest)
++  file(TO_NATIVE_PATH "${FIXTURE}" fixture)
++  file(TO_NATIVE_PATH "${FIXTURE}/spirv" shaders)
++endif()
+ set(ENV{LEONIDA_D3D12} vulkan)
+ set(ENV{LEONIDA_SHADERS} "${shaders}")
+ 
+ execute_process(
+-  COMMAND "${GTA6RT}" --run "${guest}" -- "${fixture}"
++  COMMAND ${RUNNER} "${GTA6RT}" --run "${guest}" -- "${fixture}"
+   WORKING_DIRECTORY "${guest_dir}"
+   TIMEOUT ${TIMEOUT}
+   RESULT_VARIABLE result
+
+From a8b1419fec6dbe0c634773cbf2407df1bec1189c Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:35:52 +0000
+Subject: [PATCH 2/7] fix: skip presentation for a measured zero client extent
+
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index a6911d0f4eb7d03ac5d263766551056e3929b470..c16201f6a06eb6c5edfd0076751214718438b6d0 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -9182,7 +9182,7 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
+                                                                         return {static_cast<uint32_t>(r.right - r.left),
+                                                                                 static_cast<uint32_t>(r.bottom - r.top)};
+                                                                     }
+-                                                                    return {0, 0};
++                                                                    return {UINT32_MAX, UINT32_MAX};  // client size unavailable
+                                                                 },
+                                                                 [create_surface, hinstance = GetModuleHandleW(nullptr),
+                                                                  hwnd = window, instance = info.instance]() -> VkSurfaceKHR {
+diff --git a/runtime/src/vulkan_present.h b/runtime/src/vulkan_present.h
+index 97c365b5f8450b3948ee1d1240edbd8f03c4eb67..dc7dd10bccd00f856fccdf806dc16f16fec4a850 100644
+--- a/runtime/src/vulkan_present.h
++++ b/runtime/src/vulkan_present.h
+@@ -1157,8 +1157,8 @@ private:
+         // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
+         if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+             if (extent_fn_) extent = extent_fn_();
+-            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
+-            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
++            // An unavailable client size stays undefined. A measured zero size is a minimized window.
++            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+                 extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+             }
+             if (extent.width && extent.height) {
+diff --git a/runtime/test/vk_presenter_sync_test.cpp b/runtime/test/vk_presenter_sync_test.cpp
+index a54bf6662ce6ff096ac3a6977f7a7a887bbfc86b..b3db4927cd24b5ef6ee952116fd65932600d6359 100644
+--- a/runtime/test/vk_presenter_sync_test.cpp
++++ b/runtime/test/vk_presenter_sync_test.cpp
+@@ -54,6 +54,8 @@ void pump() {
+ 
+ namespace driver {
+ PFN_vkGetInstanceProcAddr real_get_instance = nullptr;
++PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR real_surface_caps = nullptr;
++bool undefined_surface_extent = false;
+ PFN_vkGetDeviceProcAddr real_get_device = nullptr;
+ PFN_vkQueueSubmit real_submit = nullptr;
+ PFN_vkQueuePresentKHR real_present = nullptr;
+@@ -164,13 +166,24 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
+     return real_get_device(device, name);
+ }
+ 
++VKAPI_ATTR VkResult VKAPI_CALL surface_caps(VkPhysicalDevice device, VkSurfaceKHR surface,
++                                            VkSurfaceCapabilitiesKHR* caps) {
++    const VkResult rc = real_surface_caps(device, surface, caps);
++    if (rc == VK_SUCCESS && undefined_surface_extent) caps->currentExtent = {UINT32_MAX, UINT32_MAX};
++    return rc;
++}
++
+ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
++    if (std::string_view(name) == "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
++        return reinterpret_cast<PFN_vkVoidFunction>(surface_caps);
+     if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+     return real_get_instance(instance, name);
+ }
+ 
+ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDevice device) {
+     real_get_instance = instance_proc;
++    real_surface_caps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
++        instance_proc(instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
+     real_get_device = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(instance, "vkGetDeviceProcAddr"));
+     real_destroy_swapchain = reinterpret_cast<PFN_vkDestroySwapchainKHR>(real_get_device(device, "vkDestroySwapchainKHR"));
+     real_device_wait_idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(real_get_device(device, "vkDeviceWaitIdle"));
+@@ -252,7 +265,9 @@ int main() {
+         VkSurfaceKHR surface = VK_NULL_HANDLE;
+         EXPECT(create_surface(d.instance, &surface_info, nullptr, &surface) == VK_SUCCESS);
+ 
+-        VulkanPresenter presenter(context, driver::get_instance, d.instance, d.physical, d.queue, d.family, surface);
++        VkExtent2D client_extent{UINT32_MAX, UINT32_MAX};
++        VulkanPresenter presenter(context, driver::get_instance, d.instance, d.physical, d.queue, d.family, surface,
++                                  false, [&] { return client_extent; });
+         EXPECT(presenter.ok());
+         EXPECT(presenter.enable_capture());
+ 
+@@ -342,6 +357,29 @@ int main() {
+         EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
+         std::printf("presenter sync: capture-buffer WAW barriers (4/4) and full-frame read_back ok\n");
+ 
++        // Some WSI drivers leave the extent to the application. A successful query of a
++        // minimized client's 0x0 area must suppress presentation and invalidate the previous capture.
++        driver::undefined_surface_extent = true;
++        const VkExtent2D visible = ext;
++        // A failed client query still permits the last known visible size.
++        EXPECT(presenter.present(1, false) == VK_SUCCESS);
++        EXPECT(presenter.read_back(pixels, &ext, &fmt));
++        EXPECT(ext.width == visible.width && ext.height == visible.height);
++        const auto before_minimize = presenter.presented();
++        client_extent = {0, 0};
++        for (int i = 0; i < 2; ++i) {
++            EXPECT(presenter.present(1, true) == VK_SUCCESS);  // vsync change forces the first recreation
++            EXPECT(presenter.presented() == before_minimize);
++            EXPECT(!presenter.read_back(pixels, &ext, &fmt));
++        }
++        client_extent = visible;
++        EXPECT(presenter.present(1, true) == VK_SUCCESS);
++        EXPECT(presenter.presented() == before_minimize + 1);
++        EXPECT(presenter.read_back(pixels, &ext, &fmt));
++        EXPECT(ext.width == visible.width && ext.height == visible.height);
++        EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
++        driver::undefined_surface_extent = false;
++
+         // 2b. A Present behind held work shows what that work draws (queue_holds.h). The render waits for a gate with
+         //     no submitted Signal, so the queue holds it; the presents are queued behind it instead of blitting the
+         //     back buffers as they were. Three presents queue up and keep their order: a blit, a blank one (reads
+
+From cc5e050eca34568e4c44c98fb72fdb53e54c6d1f Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:37:30 +0000
+Subject: [PATCH 3/7] fix: restore verified EXEC, mesh and image-load
+ translations
+
+Backported from simomistralii/Leonida-PC PR 2, original commits by Claude: 65d5201fd3927551574af221022fc6ec64a783c1, ad0fb49cbbae399a2305a19566c1959d4bcba4e5 and 14e2312774700a09b5746d1f479170c531f74842.
+
+diff --git a/docs/design.md b/docs/design.md
+index b105eb7f0f326dad0ba987289e5ff8d53d1f3547..0bad89ec361bdcfd81b5aab98cdca0e291682c75 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -264,7 +264,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Null sources in 64-bit integer VALU compares | `v_cmp` and `v_cmpx` relations `eq`, `ne`, `lt`, `le`, `gt`, `ge` on `u64` and `i64` read `null` as the 64-bit value 0 in either source, like immediate `0`. Register pairs and immediates retain their existing semantics; `v_cmp` writes the active lane's comparison to VCC/SGPR, while `v_cmpx` narrows EXEC without changing VCC. Source: RDNA2 ISA special operand `null` reads zero; LLVM `llvm-mc -mcpu=gfx1013` accepts the encoding. CPU-checked by `tests/semantic/test_vcmp64_null_src.py` (both sources, signed/unsigned ordering, equality, e32/e64, EXEC and inactive lanes); **not GPU-verified, no corpus count**. |
+ | Execution model | One invocation = one lane. Compute and mesh waves derive lanes from the workgroup-local index; other stages use the subgroup lane. A wave = a subgroup, so cross-lane ops (`ds_swizzle`, `v_permlane*`, `v_readlane`/`v_writelane`, `v_mbcnt`) become subgroup shuffles. Wave32 pixel shaders split a 64-lane physical subgroup into two logical waves: lane IDs are `SubgroupLocalInvocationId & 31`, shuffle sources retain the current half (`& 32`), and ballots/votes use that half's 32-bit word. A value the translator knows is uniform (the bindless descriptor index) is read from the half's first running lane, never from a fixed lane, which need not be running (SHADER-1016). Other stage/wave combinations still require subgroup size == wave size or wave64 emulation. **Requires subgroup size == wave size** (wave32 maps directly onto NVIDIA GPUs; wave64 shaders need a 64-wide subgroup or emulation). `v_readlane_b32`/`v_writelane_b32` mask the lane select with 63 in wave64 (`S1[5:0]`) and 31 in wave32 (`S1[4:0]`); until SHADER-52 both used 63, so a wave32 select ≥ 32 pointed past a 32-wide subgroup. GPU-checked with `cs_w32_lane_wrap.asm` (lane 40 → 8). For the fragment-half rule, `ps_bitmask_perm` produced 4096/4096 exact pixels on an AMD Radeon RX 5700 XT; Vulkan reported a default subgroup size of 64 (range 32..64), but does not permit pinning fragment subgroup size on this device. CPU semantic tests compare a 64-lane wave32 pixel subgroup against two 32-lane subgroups for reads/writes, permutations, ballots, and votes. |
+ | DPP | VOP1/VOP2 `_dpp` applies to src0. DPP16 controls (`quad_perm`, `row_shl/shr/ror/share/xmask/mirror/half_mirror`) and DPP8 (`dpp8` + `fi`) select the source lane, then `row_mask` (one bit per 16-lane row) and `bank_mask` (one bit per 4-lane bank) decide which destination lanes update. A lane whose row/bank is off is not written. A source lane outside the row is invalid: `bound_ctrl` 1 uses 0 as src0, otherwise the lane is not written. A source lane inactive under EXEC is used when `fi` is 1; otherwise `bound_ctrl` decides. DPP8 always writes an enabled lane: `fi` 1 reads the inactive source, `fi` 0 uses 0. DPP16/8 never leaves its 16/8-lane group, so this is exact on every subgroup at least that wide; under `--wave64-emulate` the exchange goes through the workgroup buffer like the other cross-lane ops. GPU-checked with `runtime/test/shaders/cs_dpp*.asm` on an RTX 3070 and hardware-measured on an RX 6800. On an RX 6700 XT (gfx1031), `tools/crosslane_fuzz.py --dpp-sweep --oracle hw` checks every DPP16 control × `bound_ctrl` × `fi`, every `row_mask`/`bank_mask` pair and the DPP8 selects in wave32 and wave64: 14,412 cases, all matching these rules (BUILD-162, `docs/shader_validation.md` FUZZ-7). The ballot of the source lanes' EXEC bits and the shuffle are each stored to a Function variable of their own (`Gen.eager`): SPIRV-Cross (MoltenVK) inlines a single-use result into the expression that uses it, which put the ballot on the right of a short-circuiting `&&` and the shuffle in a ternary's arm, so lanes out of their row skipped the ballot and row_shr:1's lane 1 found lane 0 inactive (`cs_dpp_ops` on MoltenVK; SHADER-529). A store is a statement every lane runs. Checked in SPIRV-Cross 1.3.239's MSL for the `cs_dpp*` tests (each op is now its own statement) and by `tests/semantic/test_dpp_eager_subgroup.py`; not yet run on a Mac. Semantics from the RDNA2 ISA, AMD LLVM modifier syntax and the GPUOpen DPP notes. |
+-| EXEC | A per-invocation `active` flag. VALU writes and exports are masked by it, scalar ops aren't, and `v_cmpx`, saveexec and EXEC writes update it. A pixel lane still inactive at the end is discarded. Measured on native gfx1100 (8 threads): a `v_mov_b32` under `EXEC=0x0F` leaves the other lanes untouched, `EXEC=0` writes nothing, a store writes only active lanes and `v_cmpx_gt_u32` narrows EXEC (4 of 4 cases); note that AMD clang 20 rejects `v_add_co_u32`, `v_sub_co_u32`, `v_add_co_ci_u32` and `v_mad_u64_u32` for `gfx1100`, `gfx1101` and `gfx1102`, so this toolchain could not reproduce the RX 7600 result below, which leaves open whether those parts support the opcodes and says only that they could not be assembled here. **A pixel is written when its lane was on in EXEC at the last `exp ... vm` the path executed (if it executed one) and at the last export to the color target; a path with no export at all goes by EXEC at the end.** The `vm` half is the RDNA2 ISA reference guide's rule (30-November-2020, §11.1 and §11.2.1: EXEC at the export is the valid mask and the final one sent is used; an `exp null ... vm` carries only the mask). The color half is measured: an export sends data only for the lanes that are on, a later export to the same target replaces the earlier one for the whole wave, and a lane with no data from the last one is not written even when a later `exp null done vm` marks it valid. So `exp mrt0 done` (no `vm`) with every lane on, followed by an EXEC write, still writes every pixel, and EXEC off at that export and back on afterwards writes none. **Measured on RDNA2** (AMD Radeon iGPU, gfx1036, driver 26.10.1) with the pixel-shader oracle of #3061 (`ps_oracle.py`), hand-written ISA as the pixel shader of a real draw (wave64 stage): 18 programs that cut EXEC to half of the target before, between or after `exp mrt0` (with and without `vm` and `done`) and `exp null done vm`; all 18 fit the rule, 6 of them differed from the translator, which until 2026-11-23 discarded by EXEC at the end on a path without `vm` and kept the older export's value (or the output's initial value) for a lane that was off at the last color export. The latches (`%vm_mask`, `%col_mask_mrtN`) are only emitted where a path can write EXEC after a `vm` or color export; everywhere else EXEC at the end is the same mask and the SPIR-V is unchanged. With several color targets a pixel stays when any target got an export from its lane (Vulkan cannot skip one attachment per pixel; not measured, the oracle's pipeline has one target); `mrtz` is not part of the color mask (not measured). **Measuring exports needs `s_waitcnt expcnt(0)` after each one**: an export is asynchronous, and without the wait the hardware takes the data and the EXEC of a later moment (`v_mov v9, A; exp mrt0 v9 done vm; v_mov v9, B` shows B, and an EXEC write right after the export decides which pixels are written, which looks like "EXEC at the end decides"); 64 `s_nop 15` have the same effect as the wait. Checked on the CPU by `tests/semantic/test_export_valid_mask.py` and on the GPU by `runtime/test/shaders/ps_exp_color_mask.asm` (RTX 5080 and the Radeon). VALU scalar lane-mask destinations (`v_cmp_*`, `v_add_co_u32`, `v_add_co_ci_u32`, `v_sub_co_u32`, `v_sub_co_ci_u32`, `v_subrev_co_u32`, `v_subrev_co_ci_u32`, `v_mad_u64_u32`, `v_mad_i64_i32`) write 0 for lanes off in EXEC (`SDST[lane] = EXEC[lane] ? bit : 0`, AMD RDNA2 ISA). Until 2026-11-22 the six `*_co_*` ops and `v_mad_u64_u32`/`v_mad_i64_i32` did not AND the carry/sign bit with `active`, so inactive lanes leaked 1 bits into `VCC`/SGPR masks (`s_bcnt1`, `s_cbranch_vccz`, `v_cndmask_b32`). Checked on the CPU by `tests/semantic/test_carry_exec_mask.py` (wave32, wave64, and `--wave64-emulate` structure), and **hardware-verified on an AMD RX 7600 (gfx1102)** with `v_add_co_u32` and `v_add_co_ci_u32` carrying on every active lane: VCC reads `0xffffffff` with full EXEC, `0x0000ffff` for the mask `0x0000ffff` and `0xaaaaaaaa` for `0xaaaaaaaa` in wave32, `vcc_lo = 0x0000ffff` with `vcc_hi = 0x0000000f` for the same partial mask in wave64, and `0` when EXEC is 0 even with VCC preloaded to all ones; with one carrying lane under mask `0x0000ffff` VCC is `0x00000001`, and `v_sub_co_u32`/`v_subrev_co_u32` with a borrow under that mask give `0x0000ffff` too. The `*_co_ci_` forms, `v_mad_u64_u32` and `v_mad_i64_i32` share the same path but were not measured separately; it is also GPU-verified on native RDNA2 (gfx1036, AMD Radeon Graphics) with partial EXEC masks (inactive lanes write 0 in sdst for `v_add_co_u32` and `v_mad_u64_u32`). In a shader that writes EXEC, a run of two or more lane-local VALU instructions (no cross-lane read, no lane-mask, SCC, carry or EXEC write) sits inside one `if (active)` and writes its VGPRs directly, instead of an `OpSelect(active, new, old)` per write: the same result, but the driver predicates the run with its own EXEC instead of keeping both values live. On an RX 5700 XT (RADV) a pixel shader with 8 divergent if/else regions of `v_fma`/`v_mul`/`v_add`/`v_min`/`v_max` went from 0.85 ms to 0.69 ms (the same program as native SPIR-V: 0.65 ms). Not under `--wave64-emulate`. Checked by `tests/semantic/test_active_runs.py`. |
++| EXEC | A per-invocation `active` flag. VALU writes and exports are masked by it, scalar ops aren't, and `v_cmpx`, saveexec and EXEC writes update it. A pixel lane still inactive at the end is discarded. Measured on native gfx1100 (8 threads): a `v_mov_b32` under `EXEC=0x0F` leaves the other lanes untouched, `EXEC=0` writes nothing, a store writes only active lanes and `v_cmpx_gt_u32` narrows EXEC (4 of 4 cases); note that AMD clang 20 rejects `v_add_co_u32`, `v_sub_co_u32`, `v_add_co_ci_u32` and `v_mad_u64_u32` for `gfx1100`, `gfx1101` and `gfx1102`, so this toolchain could not reproduce the RX 7600 result below, which leaves open whether those parts support the opcodes and says only that they could not be assembled here. **A pixel is written when its lane was on in EXEC at the last `exp ... vm` the path executed (if it executed one) and at the last export to the color target; a path with no export at all goes by EXEC at the end.** The `vm` half is the RDNA2 ISA reference guide's rule (30-November-2020, §11.1 and §11.2.1: EXEC at the export is the valid mask and the final one sent is used; an `exp null ... vm` carries only the mask). The color half is measured: an export sends data only for the lanes that are on, a later export to the same target replaces the earlier one for the whole wave, and a lane with no data from the last one is not written even when a later `exp null done vm` marks it valid. So `exp mrt0 done` (no `vm`) with every lane on, followed by an EXEC write, still writes every pixel, and EXEC off at that export and back on afterwards writes none. **Measured on RDNA2** (AMD Radeon iGPU, gfx1036, driver 26.10.1) with the pixel-shader oracle of #3061 (`ps_oracle.py`), hand-written ISA as the pixel shader of a real draw (wave64 stage): 18 programs that cut EXEC to half of the target before, between or after `exp mrt0` (with and without `vm` and `done`) and `exp null done vm`; all 18 fit the rule, 6 of them differed from the translator, which until 2026-11-23 discarded by EXEC at the end on a path without `vm` and kept the older export's value (or the output's initial value) for a lane that was off at the last color export. The latches (`%vm_mask`, `%col_mask_mrtN`) are only emitted where a path can write EXEC after a `vm` or color export; everywhere else EXEC at the end is the same mask and the SPIR-V is unchanged. With several color targets a pixel stays when any target got an export from its lane (Vulkan cannot skip one attachment per pixel; not measured, the oracle's pipeline has one target); `mrtz` is not part of the color mask (not measured). **Measuring exports needs `s_waitcnt expcnt(0)` after each one**: an export is asynchronous, and without the wait the hardware takes the data and the EXEC of a later moment (`v_mov v9, A; exp mrt0 v9 done vm; v_mov v9, B` shows B, and an EXEC write right after the export decides which pixels are written, which looks like "EXEC at the end decides"); 64 `s_nop 15` have the same effect as the wait. Checked on the CPU by `tests/semantic/test_export_valid_mask.py` and on the GPU by `runtime/test/shaders/ps_exp_color_mask.asm` (RTX 5080 and the Radeon). VALU scalar lane-mask destinations (`v_cmp_*`, `v_add_co_u32`, `v_add_co_ci_u32`, `v_sub_co_u32`, `v_sub_co_ci_u32`, `v_subrev_co_u32`, `v_subrev_co_ci_u32`, `v_mad_u64_u32`, `v_mad_i64_i32`) write 0 for lanes off in EXEC (`SDST[lane] = EXEC[lane] ? bit : 0`, AMD RDNA2 ISA). Until 2026-11-22 the six `*_co_*` ops and `v_mad_u64_u32`/`v_mad_i64_i32` did not AND the carry/sign bit with `active`, so inactive lanes leaked 1 bits into `VCC`/SGPR masks (`s_bcnt1`, `s_cbranch_vccz`, `v_cndmask_b32`). Checked on the CPU by `tests/semantic/test_carry_exec_mask.py` (wave32, wave64, and `--wave64-emulate` structure), and **hardware-verified on an AMD RX 7600 (gfx1102)** with `v_add_co_u32` and `v_add_co_ci_u32` carrying on every active lane: VCC reads `0xffffffff` with full EXEC, `0x0000ffff` for the mask `0x0000ffff` and `0xaaaaaaaa` for `0xaaaaaaaa` in wave32, `vcc_lo = 0x0000ffff` with `vcc_hi = 0x0000000f` for the same partial mask in wave64, and `0` when EXEC is 0 even with VCC preloaded to all ones; with one carrying lane under mask `0x0000ffff` VCC is `0x00000001`, and `v_sub_co_u32`/`v_subrev_co_u32` with a borrow under that mask give `0x0000ffff` too. The `*_co_ci_` forms, `v_mad_u64_u32` and `v_mad_i64_i32` share the same path but were not measured separately; it is also GPU-verified on native RDNA2 (gfx1036, AMD Radeon Graphics) with partial EXEC masks (inactive lanes write 0 in sdst for `v_add_co_u32` and `v_mad_u64_u32`). In a shader that writes EXEC, a run of two or more lane-local VALU instructions (no cross-lane read, no lane-mask, SCC, carry or EXEC write) sits inside one `if (active)` and writes its VGPRs directly, instead of an `OpSelect(active, new, old)` per write: the same result, but the driver predicates the run with its own EXEC instead of keeping both values live. On an RX 5700 XT (RADV) a pixel shader with 8 divergent if/else regions of `v_fma`/`v_mul`/`v_add`/`v_min`/`v_max` went from 0.85 ms to 0.69 ms (the same program as native SPIR-V: 0.65 ms). Not under `--wave64-emulate`. Checked by `tests/semantic/test_active_runs.py`. **A scalar result written to `exec_lo` or `exec_hi` (SHADER-1264)** turns on the lanes whose bit is set: lane L takes bit L mod 32 of the value, as for a constant. That is exact both for a plain number (the same in every invocation: `s_lshl_b32 exec_lo, 1, s5`, `s_add_u32`, `s_bfm_b32`) and for a lane mask (0 or ~0 per invocation). Until 2026-11-24 a computed value was tested for non-zero, which turned on the whole half for any number but 0 (the first three cases of `cs_w32_exec_computed.asm` ran all 32 lanes, measured on an RTX 5070 per that file's header). Checked on the CPU by `tests/semantic/test_exec_computed.py` (wave32 and wave64, the words derived by hand in `runtime/test/shaders/cs_w32_exec_computed.asm` and `cs_w64_exec_computed.asm`); the GPU run of those two fixtures with this rule is not yet recorded. |
+ | `s_*_saveexec_b32/b64`, `s_andn1/andn2_wrexec_b32/b64` | RDNA2 ISA SOP1. saveexec: `D = EXEC; EXEC = f(S0, EXEC); SCC = (EXEC != 0)`. wrexec: `EXEC = f(S0, EXEC); D = EXEC`. `f` is one of `and`, `or`, `xor`, `andn1` (`~S0 & EXEC`), `andn2` (`S0 & ~EXEC`), `orn1` (`~S0 \| EXEC`), `orn2` (`S0 \| ~EXEC`), `nand`, `nor`, `xnor`, the table in `Gen.EXEC_LOGIC`. The definitions match `tools/cf_ref.py` `_SAVEEXEC`, the FUZZ-8 model. Each invocation holds its own lane's bit (0 or ~0), so `f` is the bitwise op on that bit. A lane EXEC had off becomes active when `f` gives 1 for it (`nand`, `nor`, `orn1`, `orn2`, `xnor`, ...), as on hardware, and SCC is the wave vote. Until 2026-11-22 only `and`/`or`/`andn2_saveexec` and `andn2_wrexec` were translated. CPU-checked by `tests/semantic/test_saveexec_variants.py` (all ten saveexec kinds in wave32 and wave64, both wrexec kinds, partial EXEC and S0, an empty result, every lane against `cf_ref._SAVEEXEC`) and by `tools/cf_diff.py` (300 programs × wave32/64 still pass). Hardware-verified on native RDNA2 (`gfx1036`, Windows 11, driver `32.0.21045.29003`, wave32 & wave64, 0 mismatches): all 10 `saveexec` kinds and both `wrexec` kinds (`andn1`/`andn2`) match bit-for-bit on non-symmetric masks (`src0 = 0x0F0F0F0F`, `exec = 0x33333333` in wave32; `0x0F0F0F0F_00FF00FF` / `0x33333333_55555555` in wave64), zero-result `SCC = 0`, wave64 upper-32-bit-only `new_exec = 0x00000001_00000000` setting `SCC = 1`, and `sdst == src0` register aliasing (`s4, s4` and `s[4:5], s[4:5]`) reading original `src0` before writing old `EXEC` to `sdst`. **Not GPU-verified** for the seven new kinds. Measured on native gfx1100 (single 8-lane workgroup, 36 programs): all ten `saveexec` kinds and both `wrexec` forms follow `f` for three `S0`/`EXEC` pairs, including lanes `EXEC` had off being switched back on (`nand` with `S0=0x03`, `EXEC=0x0F` leaves `0xFFFFFFFC`, activating lanes 4-7), `D` holding the old `EXEC` for `saveexec` and the new one for `wrexec`, and `SCC` the `EXEC != 0` vote. |
+ | Control flow | Reducible graphs use structured branches and natural loops. Irreducible graphs use the dispatch-loop form, which can also be forced with `--dispatch-loop` for comparisons. The control-flow unit test checks 18,228 generated graphs. Irreducible graphs use node splitting (`cfg_structure.split_irreducible`, up to `min(2*N, N+64)` blocks) and fall back to the dispatch-loop form when capped; it can also be forced with `--dispatch-loop` for comparisons. `cfg_structure.structure`, `cfg_structure.run`, and `rdna2spirv.assemble`'s structured emitter are iterative and hoist each guarded member's dominated tail continuation out of its enclosing guard (exact by strict dominance: no block outside the guard's subtree can target the continuation), keeping `OpSelectionMerge` nesting O(1) on sequential diamond/loop chains instead of nesting O(N) deep and hitting Python's recursion limit on multi-thousand-block shaders (e.g. 2,000 sequential diamonds nest to depth 2 instead of 2,000). The control-flow unit test (`tests/test_cfg_structure.py`) checks 20,000 generated graphs plus 2,000-diamond, 1,200-loop, and 1,500-early-exit chains. AMD A/B checks compare the two forms for selected pixel shaders with defined test inputs. For shaders that never export colour, the comparison checks pixel coverage. **Nesting is bounded (SHADER-299):** a tree deeper than `MAX_STRUCTURED_DEPTH` (16) is emitted in the dispatch-loop form instead, since `spirv-val` time grows roughly with the cube of the measured nesting depth. **Nesting is bounded (SHADER-299, SHADER-427):** a tree deeper than `MAX_STRUCTURED_DEPTH` (64; `--max-structured-depth N`, 0 = no bound) is emitted in the dispatch-loop form instead, since `spirv-val` time grows roughly with the cube of the measured nesting depth. Before #1904, over the 1.0.2.1 corpus (26,503 modules, `spirv-val` 2026.4): the deepest block of a module is nested 118 constructs deep, 12,963 modules are structured (median 15) and 6,000 of those are deeper than 16; an estimated 85% of the corpus's `spirv-val` time is in modules nested 20 or deeper. Median `spirv-val` time for the same module in each form: depth 20 181 -> 129 ms (1.4x), 30 507 -> 371 (1.4x), 50 1,712 -> 738 (2.3x), 64 2,692 -> 1,163 (2.3x), 77 5,122 -> 1,130 (4.5x), and the deepest (118) 13,683 -> 1,352 ms (10.1x). Depth 5-12 shows no gain (at depth 6 the flat form is slightly slower), which is why the bound first sat at 16. Since #1904 (`cfg_structure` hoists tails) the deepest tree in the corpus is 29: of 12,944 structured modules, 1,031 are deeper than 16 (747 CS, 284 PS), 57 deeper than 20, 24 deeper than 24. For those 1,031 the flat form saves only 12% of `spirv-val` time (1,235 -> 1,091 s summed, slowest module 8.3 -> 5.9 s), while on an RTX 5070 Ti (NVIDIA 621.24) it compiles slower: the 284 pixel shaders 1.67x (827 -> 1,382 s summed, two rounds), four compute modules at depth 19-24 2.0x (297 -> 591 s, 1.6-2.7x each), so the bound now sits above the corpus (SHADER-427). Both forms pass `spirv-val` on a 200-shader slice (200/200 each), and `gen.nesting` records the tree depth. AMD's Windows driver adds a reason to keep the structured form (SHADER-995): on a Radeon gfx1036 iGPU (32.0.21042.62) the dispatch-loop module of `XboxBvhBuilder.dll`'s `LeafRehydration` (tree depth 18, a 581-case switch) takes 34 minutes to create (XXDESIGN), where its structured module is created in 2.9 s; ten other programs of that DLL compile in the dispatch-loop form there in 0.4-40 s, 2.5-5x their structured time ([embedded_shaders.md](embedded_shaders.md), section 7). |
+ | User data | **Push constants, 144 bytes:** dwords 0–31 = initial s0–s31 (the user SGPRs the console driver loads from the root signature: descriptor-table pointers, constants and so on), dwords 32–33 = the 64-bit **heap base**, dwords 34–35 = the **code base**: the Xbox VA where the runtime uploaded this shader's whole FSSM blob. `--mesh-compute` modules add dwords 36–37, the output buffer address (152 bytes; see "Mesh shaders as compute"). `--pc-tail-ubo` keeps only dwords 0–31 here (128 bytes) and moves the rest to a uniform block (see "Push-constant tail as a uniform block"). The runtime has to reproduce the console driver's root-signature-to-user-SGPR mapping; that comes from the exe or driver behaviour. |
+@@ -325,7 +325,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Wave size | **Most of the game's shaders are wave64: 23,841 of 26,503** (`fssm_header.wave_size()`: FSSM header flags word `u32[0xD4]` bit 5, `0x20` = wave32, `0` = wave64; 0 contradictions against GFX10 code-proven wave32/wave64 instructions across all 26,503 blobs): 10,974 of 12,101 PS, 9,282 of 9,282 mesh shaders, 2,236 of 2,236 VS, 1,154 of 2,689 CS and 195 of 195 GS, against 2,662 wave32 (1,535 CS and 1,127 PS). A full-corpus translation at `ec8ec4c9` marks exactly these 23,841 `wave64` (`subgroup_size` 64) in the index. Before the FSSM flag (#1900) the wave size came from code markers (64-bit EXEC/mask writes, `exec_hi`, `*_saveexec_b64`): at `6a6704df` they made 21,538 of the 26,487 shaders translated then wave64 (the figure quoted here was 21,545). 10,031 PS, 9,282 mesh shaders, 1,179 VS, 851 CS and 195 GS (the 16 shaders refused then are all wave64 CS by the flag; the figure quoted here was 21,545). Against the flag they call 2,287 wave64 shaders wave32 (943 PS, 1,057 VS, 287 CS), whose code has no 64-bit EXEC/mask marker, and none the other way. An older marker scan (`s_mov_b64 exec, -1`, `exec_hi`, `s_and/or_saveexec_b64` and 64-bit masks) counted 9,930 PS, 8,666 mesh shaders, 1,115 VS and 923 CS, but it left out the 769 listings whose names start with `.` (616 of them mesh shaders; Python's `glob` skips such names). Over all 26,503, the translator's own marker test (`WAVE64_RE`, or a 64-bit op on EXEC/VCC) on the code `translate()` keeps finds 21,554 wave64: 10,031 PS, 9,282 mesh shaders, 1,179 VS, 867 CS and 195 GS. With the 2,287 above that is exactly the flag's 23,841, and none contradicts it; read raw, 104 more wave32 listings (80 CS, 24 PS) seem to carry a marker, all from embedded data words decoded as instructions. The first marker scan (`s_mov_b64 exec, -1`, `exec_hi`, `s_and/or_saveexec_b64` and 64-bit masks, written into this row at `0082ad53`) counted 9,930 PS, 8,666 mesh shaders, 1,115 VS and 923 CS: 20,634 without the GS, so not the 21,545 total either. The translator maps a wave to a subgroup, and NVIDIA subgroups are 32 wide. What that means: (1) lane-independent code, which is most pixel-shader math, is exact; (2) wave-wide branch decisions and reductions are made per 32-lane half, which is exact unless scalar state computed for one half is later consumed by the other; (3) lane indices from `v_mbcnt_lo/hi` and wave IDs from the merged-wave SGPR must be 64-lane values. Mesh and compute shaders build thread IDs as wave_id·64 + mbcnt, so those need a mapping from `LocalInvocationIndex` (lane = index & 63, wave = index >> 6). Full fidelity needs either 64-wide subgroups (AMD GPUs, via `VK_EXT_subgroup_size_control` requiredSubgroupSize = 64) or emulating cross-half ops (ballot, readlane, shuffles across halves) through workgroup memory. |
+ | Mesh shaders | NGG wave64 programs → `VK_EXT_mesh_shader` (`MeshEXT`). **PSV0** (DXBC) gives NumThreads (128×1×1 in the corpus), MaxOutputVertices/Primitives (128/128) and the topology (triangles). System inputs, from Mesa's RADV setup for mesh as NGG on GFX10.3: v5 = first launch vertex ID of the lane (the "vertex_id" slot), `linearGroupIndex * NumThreads + LocalInvocationIndex` with the linear index from WorkgroupId/NumWorkgroups; all 9,282/9,282 corpus mesh shaders read `v5` once with `v_readfirstlane_b32 sX, v5` and use `sX` only via `s_lshr_b32 D, sX, 7` to recover the group index (NumThreads is 128 in the corpus), matching TomBox's mesh ABI (`gid.x * numThreads + gi`) on 1D launches. GPU-checked with `runtime/test/shaders/ms_v5_workgroup.asm` (24/24 groups exact on RTX 4060 Ti and RTX 3080, and on an RTX 4050 Laptop and an AMD Radeon 740M (RADV)); still unverified on Xbox hardware: the low 7 bits of `v5` on lanes 1..127 and whether 3D `DispatchMesh` flattens XYZ or uses X only. The merged-wave-info SGPR (s3 in this ABI) = wave ID << 24, from LocalInvocationIndex >> 6; `v_mbcnt` lanes = LocalInvocationIndex & 63; user data in s16.. as usual. All 9,282 mesh-shader listings of 1.0.2.1 (names starting with `.` included) read exactly v5 before writing anything (`rdna2spirv.read_before_write_vgprs` over the code `translate()` keeps). An earlier sample of 1,500 put 27 aside as adding loop-carried registers; over the corpus no extra read is loop-carried. Read raw, 266 of the 309 listings with embedded data words seem to read more VGPRs, each after a branch (in 101 the register is written after the read); they come from data words decoded as instructions and are gone once the listing is re-anchored to the FSSM code and cut to reachable code, as `translate()` does. 1,473 of 1,500 sampled mesh shaders read exactly v5, and the rest only add loop-carried registers. Exports: on NGG, thread t exports vertex t (`pos0`, `paramN`) and primitive t (`prim`). They're staged per invocation; an all-`off` export is the dummy a wave with no vertices must issue, and writes nothing. `s_sendmsg GS_ALLOC_REQ` (m0 = prims << 12 \| verts, sent by thread 0) stores the counts in a workgroup variable. At shader end, in uniform control flow: workgroup barrier, `OpSetMeshOutputsEXT(min(verts, max), min(prims, max))`, then each thread writes its staged vertex (Position + Location N) and primitive (`PrimitiveTriangleIndicesEXT` = bits [8:0], [18:10], [28:20]; `CullPrimitiveEXT` = bit 31). `pos1..pos3` clip/cull distances are staged per invocation and emitted in a per-vertex `Block` output struct (`Position` + `ClipDistance`/`CullDistance` arrays, `VK_EXT_mesh_shader`) when used, keeping the standalone `%ms_out_pos` layout unchanged for shaders without `pos1+`. The distances are copied to that struct one float at a time, not as a whole array: SPIRV-Cross 1.4.363.0 turns a whole-array store into a mesh output into a C array assignment that Metal rejects (SHADER-155; `ms_clip` then compiles and draws its 2048/4096 pixels in a native Metal mesh draw on an Apple A18 Pro). GPU-checked with `runtime/test/shaders/ms_tri.asm` (`VKH_MESH=1 vk_harness`), built from the game's own idioms (thread ID from s3 and mbcnt across two waves, thread-0 ALLOC_REQ, per-thread exports): 0 error on every pixel. |
+ | Mesh shaders as compute (`--mesh-compute`) | For devices without `VK_EXT_mesh_shader` (NVIDIA Pascal, for one), and on by itself in `make_game.py` on Intel's Windows Vulkan driver (`VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS` with mesh shaders, `runtime_gpu_mesh_draws_crash`): there `vkCmdDrawMeshTasksEXT` crashes (0xC0000409 in `igvk64.dll`) for a mesh shader with a live push-constant load at byte 32 or later, which every corpus mesh shader has, while `--mesh-compute` is exact (BUILD-2202, Arc A770, driver 32.0.101.9175; no fixed version known; `--native-mesh` keeps native mesh shaders). Each mesh shader becomes a `GLCompute` module with the same workgroup size and code; only the epilogue changes. Instead of `OpSetMeshOutputsEXT` and the mesh outputs, after the same barrier lane 0 writes the vertex and primitive counts, lane i < vertex count writes its vertex and lane i < primitive count its primitive into this workgroup's **slot** of an output buffer: slot = linear workgroup index (x + y·nx + z·nx·ny) × `slot_bytes`, computed in 64 bits. The buffer's device address is in push-constant dwords 36–37, so these modules declare 152 bytes. Slot layout (`rdna2spirv.mesh_compute_layout`, recorded per shader as `mesh_compute` in the index), all 16-byte aligned: a header (vertex count, primitive count), then `max_vertices` vertices, each holding the position, the clip and then cull distances padded to whole vec4s, and one vec4 per param location; then `max_primitives` primitives of three vertex indices plus 1 if culled. The modules need no mesh capability, extension or `shaderClipDistance`. `tools/mesh_compute_vs.py` writes the vertex shader that draws the slots with a non-indexed `vkCmdDraw(groups × max_primitives × 3)`: vertex v is workgroup v / (3·max_primitives), primitive (v / 3) mod max_primitives, corner v mod 3. A primitive past the count, or one culled, gets one position outside the clip volume at all three corners and is clipped. Otherwise the corner's index, clamped to `max_vertices` − 1, selects the vertex, and its position, distances and params go out at the mesh shader's locations, so the pixel shader is unchanged. One draw rasterizes in vertex order, which is workgroup then primitive order, as with mesh workgroups. Corpus: all 9,282 mesh shaders are 128×1×1 with 128/128 outputs, wave64, 0–18 params, clip distances in 1,906, cull distances and per-primitive attributes in none, no task shaders. On a 32-wide device combine it with `--wave64-emulate`. GPU-checked on an NVIDIA GeForce GTX 1060 6GB (Pascal: no mesh shaders; driver 560.94, Windows 10) with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`: `ms_tri`, `ms_w64x_ballot` and `ms_wave_info_s3` 4096/4096 pixels exact, `ms_clip` 2048/4096 covered as expected, `ms_v5_workgroup` 24/24 workgroup coordinates, zero Khronos validation messages. Checked in `tests/test_mesh_compute.py`. The runtime side, turning a `DispatchMesh` into that dispatch, a barrier and the draw, is the follow-up (it needs the graphics pipelines of #291). Unused primitives still run the vertex shader; compaction with an indirect draw would avoid that. |
+-| Mesh primitive export and allocation (`exp prim`, `MSG_GS_ALLOC_REQ`) | The GFX10 NGG formats, from Mesa 22.3 `src/amd/llvm/ac_llvm_build.c`: `ac_build_sendmsg_gs_alloc_req` (lines 4475–4477) puts `prim_cnt << 12 \| vtx_cnt` in m0, and `ac_pack_prim_export` (lines 4518–4539) packs index 0, 1 and 2 in bits 0–8, 10–18 and 20–28, the edge flags in bits 9, 19 and 29 and "null primitive (skip)" in bit 31. Thread t exports vertex t and primitive t, only below the vertex and primitive counts (`src/amd/common/ac_nir_lower_ngg.c`, `emit_ms_finale`, lines 4056–4067). Translated: the counts from m0 (each clamped to PSV0's maximum) go to `OpSetMeshOutputsEXT` or the `--mesh-compute` header; `PrimitiveTriangleIndicesEXT` takes the three 9-bit fields without the edge flags, and `CullPrimitiveEXT` (or the slot's culled word) is bit 31; invocations at or past a count write nothing. Executed for both paths in `tests/semantic/test_ms_prim_export.py` (72 threads in two wave64 waves: odd threads set the edge flags, threads with t & 2 the null bit). Open: the index fields are not clamped to the vertex count as Mesa's mesh lowering clamps them (`ac_nir_lower_ngg.c` line 4112), so a null primitive whose fields point past the count (skipped on hardware) would be undefined in SPIR-V; no corpus count of such exports exists. |
++| Mesh primitive export and allocation (`exp prim`, `MSG_GS_ALLOC_REQ`) | The GFX10 NGG formats, from Mesa 22.3 `src/amd/llvm/ac_llvm_build.c`: `ac_build_sendmsg_gs_alloc_req` (lines 4475–4477) puts `prim_cnt << 12 \| vtx_cnt` in m0, and `ac_pack_prim_export` (lines 4518–4539) packs index 0, 1 and 2 in bits 0–8, 10–18 and 20–28, the edge flags in bits 9, 19 and 29 and "null primitive (skip)" in bit 31. Thread t exports vertex t and primitive t, only below the vertex and primitive counts (`src/amd/common/ac_nir_lower_ngg.c`, `emit_ms_finale`, lines 4056–4067). Translated: the counts from m0 (each clamped to PSV0's maximum) go to `OpSetMeshOutputsEXT` or the `--mesh-compute` header; `PrimitiveTriangleIndicesEXT` takes the three 9-bit fields without the edge flags, and `CullPrimitiveEXT` (or the slot's culled word) is bit 31; invocations at or past a count write nothing. Executed for both paths in `tests/semantic/test_ms_prim_export.py` (72 threads in two wave64 waves: odd threads set the edge flags, threads with t & 2 the null bit). Open: the index fields are not clamped to the vertex count as Mesa's mesh lowering clamps them (`ac_nir_lower_ngg.c` line 4112), so a null primitive whose fields point past the count (skipped on hardware) would be undefined in SPIR-V; no corpus count of such exports exists. **The ALLOC_REQ counts are written by every invocation that sends the message**, with a relaxed Workgroup-scope `OpAtomicStore` of the uniform m0, and read once after the barrier before `SetMeshOutputsEXT`. SHADER-766 let only local index 0 store them to avoid a plain-store race, which left the counts at 0 when another wave sends the message alone: `ms_wave_info_s3.asm` (wave 1 sends it, wave 0 skips it) drew nothing on llvmpipe (Mesa 25.2.8, LLVM 20.1.2) on every run, and now and then on RADV and AMD's Windows driver (#6172). With the atomic store it passes 3 of 3 runs on llvmpipe; checked by `tests/test_mesh_alloc_single_writer.py`. |
+ | Geometry shaders | On output stream zero, `GS_OP_EMIT_CUT` emits the staged vertex and ends its strip under the same EXEC guard. The synthetic `gs_emit_cut.asm` checks that six vertices form two separate triangles. [RDNA 2 ISA, S_SENDMSG](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content). All 195 are `$GS_VoxelizeGeneric` permutations: legacy (merged ES/GS) wave32 programs on LDS rings, with no `exp`. All 195 are `$GS_VoxelizeGeneric` permutations: legacy (merged ES/GS) programs on LDS rings, with no `exp`, written for wave64 (the FSSM header's wave-size flag says wave64 in 195 of 195, see *Wave size*, and the translator's index marks all 195 `wave64` with `subgroup_size` 64 at `f847748c`; the code agrees: the EXEC prologue that `gs_tri.asm` mirrors compares the thread count with 64 and writes a 64-bit EXEC, the count in #94 finds `v_mbcnt_hi_u32_b32` in all 195, and the translator marks all 195 `wave64`; an earlier version of this row said wave32, TEST-251). Inputs: vertex i sits at the dword offset in v0 lo / v0 hi / v1 lo; an LDS read at vertex base + 4·(4·reg + comp) is input-signature register reg, component comp (checked: SV_Position xyz in dwords 0–2 and TEXCOORD0.xy in 4–5, as ISG1 declares). Outputs: emitted vertex k is dwords [k·4·nreg, (k+1)·4·nreg) of the lane's GSVS area, dword = 4·reg + comp of the output signature (20 dwords = 5 OSG1 registers; every write matches a declared mask). Translation: synthetic offsets (vertex i at dword 64·i), LDS reads → `gl_in[i]` inputs, LDS writes → staged slots, `MSG_GS EMIT` → copy slot (emit count) to the outputs + `OpEmitVertex`, `CUT` → `OpEndPrimitive`, `GS_DONE` → nothing. The prologue's `s_bfm_b64`/`s_cselect` EXEC setup is fed s3 = 64 << 8. GPU-checked with `runtime/test/shaders/gs_tri.asm` (`VKH_GS=… vk_harness`): 0 error. Without a geometry stage (Apple GPUs: Metal, MoltenVK), `tools/spirv_gs_to_compute.py` lowers the translated module to a compute capture pass, one invocation per input primitive: inputs come from a buffer, each `OpEmitVertex` guards its record/meta stores and `%gsc_n` increment on `n < OutputVertices` (dropping excess vertices rather than overflowing into the next primitive's slots, and updating `OpPhi` predecessors across split blocks, and rejecting (`Unsupported`) an `OpEmitVertex` in a loop header before its `OpLoopMerge`, which the split would move; SHADER-617, checked on the CPU by `tests/test_spirv_gs_to_compute_bounds.py`), and a meta buffer holds each primitive's vertex count (`<= OutputVertices`) and strip ends, for an ordinary draw afterwards (SHADER-159). Metal, MoltenVK), `tools/spirv_gs_to_compute.py` lowers the translated module to a compute capture pass, one invocation per input primitive: inputs come from a buffer, each `OpEmitVertex` writes the outputs to a record buffer, and a meta buffer holds each primitive's vertex count and strip ends, for an ordinary draw afterwards (SHADER-159). `gs_tri` lowered this way, converted with SPIRV-Cross and run natively on an Apple A18 Pro: 195/195 records exact for 65 random triangles, and the captured fullscreen triangle drawn from the records matches all 4096 gradient pixels. Not done: wiring it into a draw path, and GS that use cross-lane operations or more than one invocation. |
+ | Integer clamp | The VOP3 `clamp` bit on `v_add_nc_u32`, `v_sub_nc_u32`, `v_subrev_nc_u32` saturates the result to [0, 0xFFFFFFFF], and on `v_add_nc_i32`/`v_sub_nc_i32` to [0x80000000, 0x7FFFFFFF]; without it they wrap. GFX9+ semantics: LLVM selects `uaddsat`/`usubsat` and `saddsat`/`ssubsat` to exactly these ops with clamp set. **Until this change clamp was silently ignored on the unsigned ops** (and the signed ones were `Unsupported`). Checked on the CPU by `tests/semantic/test_alu_add_nc_clamp.py`. The carry-out unsigned ops (`v_add_co_u32`, `v_sub_co_u32`, `v_subrev_co_u32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32`, `v_subrev_co_ci_u32`) with VOP3 `clamp` likewise saturate D to `0xFFFFFFFF` on add carry or `0` on sub borrow while still reporting the real carry/borrow bit in `sdst` (**until 2026-11-22 the translator ignored `clamp` on all six**); confirmed natively on RDNA2 (AMD Radeon 680M `gfx1035` wave32 & wave64 via `tools/hw_oracle`, and independently on `gfx1036` in #1746) and CPU-checked by `tests/semantic/test_alu_add_co_clamp.py`. The 16-bit unsigned add/sub (`v_add_nc_u16`, `v_sub_nc_u16`, and the `v_add_u16`/`v_sub_u16`/`v_subrev_u16` `_e64` names) saturate to [0, 0xFFFF] with `clamp` (llvm-mc 21 gfx1030 encodes the bit on them, and LLVM selects i16 `uaddsat`/`usubsat` to them); **until 2026-11-22 the translator wrapped instead**. `clamp` on any other 16-bit integer op raises `Unsupported`. CPU-checked by `tests/semantic/test_alu_u16_clamp.py` (the high half of the destination is kept), **not GPU-verified**. CPU-checked by `tests/semantic/test_alu_u16_clamp.py` (the high half of the destination is kept), and **Hardware-verified on RDNA2** (AMD Radeon 680M, `gfx1035`, Windows 11, driver `26.5.1`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137): all 32-bit and 16-bit `*_nc_*` `clamp` cases (including `op_sel` and kept destination half on u16) match hardware bit-for-bit. **Open divergence measured on the same hardware:** `v_add_co_u32`, `v_sub_co_u32`, `v_subrev_co_u32`, `v_add_co_ci_u32`, `v_sub_co_ci_u32` and `v_subrev_co_ci_u32` with `clamp` saturate D (`0xFFFFFFFF` / `0`) while still reporting the real carry/borrow in `sdst`, whereas the translator currently ignores `clamp` on these carry-out ops. |
+ | Push-constant tail as a uniform block (`--pc-tail-ubo`) | For devices whose `maxPushConstantsSize` is 128, Vulkan's minimum, which can't take the 144-byte block (152 with `--mesh-compute`): AMD's older Windows drivers on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5 7600's iGPU on 24.10.24; a 610M on 26.11.2 reports 256) and some Intel Arc drivers (D3D-14, `push_constants_need_fallback` in `d3d12_vulkan_device.cpp`). The push-constant block keeps dwords 0–31 (s0–s31, 128 bytes). The tail that follows them by default, the heap base and code base and, with `--mesh-compute`, the output address, becomes `%pc_tail`: a uniform block at **set 1, binding 0** with the same members in the same order at offsets 0, 4, … (16 bytes, 24 with `--mesh-compute`). Set 1 is otherwise unused, so set 0's update-after-bind table doesn't change. The block is declared, and listed in the entry point's interface, only when the shader reads the tail (a memory access through the heap base, `s_getpc_b64`, or the `--mesh-compute` epilogue); the index then records `"pc_tail": {"set": 1, "binding": 0, "bytes": 16}`, and `"push_constant_bytes"` is 128 for every module. `"bindings"` still lists set 0 only. Without the flag nothing changes. **Checked:** `tests/test_pc_tail_ubo.py`; all 185 hand-written GPU test shaders pass `spirv-val` with the flag (109 of them read the tail) with set-0 bindings unchanged. The GPU harnesses and the D3D12 layer that bind the block are the follow-ups. |
+@@ -450,6 +450,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Relative SGPR reads (`s_movrels_b32`, `s_movrels_b64`) | `D = SGPR[S0 + M0]`; the b64 form reads the pair at `S0 + M0` and `S0 + M0 + 1` (RDNA2 ISA SOP1). The SGPR file is a Function-scope uint array, so this is a dynamic load, as for `v_movrels`. Every SGPR write stores into that array (`store_reg`), so the load sees the current value. All reads happen before the destination is written, so D may overlap the source. SCC is not written. The index wraps to the 128 array slots, so it cannot reach the lane-mask parking slots past them. An SGPR that `lane_masks.py` marks as a lane mask (a saved EXEC, a `v_cmp` result) holds only this lane's bit, so the whole wave's mask word is collected for each such SGPR (as for `s_bcnt1`) and read instead when the index lands on it; D then holds the mask as data (SHADER-284, CPU-checked by `tests/semantic/test_salu_movrels_lane_mask.py`, wave32 and wave64). **Not modelled:** the hardware's range check, and reads past s105 landing on VCC and the other special registers. `s_movreld_b32/b64`, the relative writes, stay `Unsupported`, because the translator keeps translate-time knowledge of SGPR values (literal S# words, descriptor caches) that a dynamic write would invalidate. Until 2026-11-22 both reads raised `Unsupported`. CPU-checked by `tests/semantic/test_salu_movrels.py` (M0 from 0 to 5 and from a register, the b64 pair, an overlapping destination, SCC kept, `s_movreld` rejected). **Hardware-verified on RDNA2** (`gfx1035`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137, SCC kept; lane-mask SGPR collection is CPU-checked only). **Not GPU-verified.** |
+ | `v_div_fixup_f16`, `v_div_fixup_f64` | Final IEEE-754 special-case fixup for division (VOP3, `S0` quotient, `S1` denominator, `S2` numerator) under the game's `MODE` (`ieee=0, denorm16_64=3, dx10_clamp=1`): `sign_out = sign(S1) ^ sign(S2)`; `NaN(S2)` → quieted `S2`; `NaN(S1)` → quieted `S1`; `NaN(S2)` → `S2` unchanged (sNaN not quieted under `IEEE=0`); `NaN(S1)` → `S1` unchanged; `(0/0)` or `(±inf/±inf)` → canonical negative qNaN (`0xFE00` for f16, `0xFFF80000_00000000` for f64); `(x/±inf)`, `(±0/y)`, or guaranteed exponent underflow (`exp(S2) - exp(S1) <= -25` for f16, `<= -1075` for f64) → `±0` with `sign_out`; `(x/±0)`, `(±inf/y)`, or guaranteed exponent overflow (`exp(S2) - exp(S1) >= 16` for f16, `>= 1024` for f64) → `±inf` with `sign_out`; otherwise `copysign(S0, sign_out)` (including `NaN(S0)` keeping its payload with `sign_out`). `(x/±inf)` or `(±0/y)` (plus `exp(S2) - exp(S1) <= -1076` on f64 only; f16 has no exponent-difference cutoff) → `±0` with `sign_out`; `(x/±0)`, `(±inf/y)`, or `NaN(S0)` → `±inf` with `sign_out` (no exponent-difference overflow cutoff on either f16 or f64); otherwise `copysign(S0, sign_out)`. Computed bit-exactly on integer words (no `OpCapability Float64` for plain `v_div_fixup_f64`); VOP3 input modifiers (`abs`/`neg`, plus `op_sel:[s0,s1,s2,dst]` on f16 with the unwritten half preserved) and `clamp`, which applies in every MODE. `mul:2`/`mul:4`/`div:2` are ignored by hardware here: measured by @fiestorra on a gfx1036 iGPU (Radeon(TM) Graphics, drivers `31.0.24002.92` and `32.0.21045.29003` (the same counts on both), raw ISA through `tools/hw_oracle`, `tools/f64_omod_probe.py`, 4 inputs x 5 modifier forms x 5 MODEs for each of the two ops, wave32 and wave64 identical), the f16 and the binary64 result scale only under `IEEE=0` with `denorm_mode_16_64=0`; under `denorm_mode_16_64=3` the scaling is dropped while `clamp` still saturates, which is the `MODE` this row assumes, so only `clamp` is applied and `Float64` is enabled on f64 only when `clamp` is requested. Source: AMD [RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) (`V_DIV_FIXUP_F16`, `V_DIV_FIXUP_F64`). **Not measured on RDNA2 hardware** (translated GPU output checked on RTX 5070 by @duudiis). **Hardware-measured on RDNA2** (`gfx1036`, Windows driver `32.0.21042.62`, `tools/hw_oracle`, `ieee=0, denorm16_64=3, dx10_clamp=1`, wave32, by @timelery): `NaN(S0)` → `±inf`, f16 has no exponent-difference underflow/overflow check, f64 has underflow cutoff `e2 - e1 <= -1076` with no overflow check, and sNaN passes through unchanged under `IEEE=0`. Checked bit-for-bit on the CPU (`spirv_mini_interp`) and with `spirv-val` by `tests/semantic/test_alu_div_fixup.py`; not run on the shader corpus. |
+ | Image instruction without a VGPR data operand | `llvm-mc` accepts `off`, an SGPR or a constant where an `image_*` instruction names the VGPR range of its result or data (`image_sample off, v[1:2], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D`); no compiler emits it (the texels would have nowhere to go). The translator raises `Unsupported` (`<op> destination` for `image_op` and `image_get_lod`, `<op> data` for the `image_misc` group: `image_load_mip`, `image_get_resinfo`, `image_store`, the atomics) instead of the `KeyError` it gave when it wrote the result. A probe of about 60,000 DS, MUBUF, MTBUF, MIMG, SMEM and FLAT/GLOBAL/SCRATCH operand and modifier variations (glc, slc, dlc, lds, tfe, d16, a16, unorm, dmask, dim, offset, idxen, offen, addr64, format; as written and as `llvm-mc` prints them; pixel and compute stages) found no other `IndexError`, `KeyError` or `TypeError`. CPU-checked by `tests/semantic/test_mem_crash_forms.py`. |
++| Image load status (`tfe`, `lwe`) | With `tfe` or `lwe` an `image_load` returns one more dword after its data, the fetch status, in `vdata[n]`: n is `popcount(dmask)`, or that halved and rounded up under `d16` (RDNA2 ISA, MIMG TFE/LWE; SHADER-1266). The translator binds only fully resident, non-sparse resources, so it writes 0 there, masked by EXEC like any VALU write; until 2026-11-24 the status VGPR kept its old value. Checked on llvmpipe (Mesa 25.2.8, LLVM 20.1.2) by `runtime/test/shaders/cs_imgload_tfe.asm` and `cs_imgload_d16_tfe.asm`, which seed the status with 1000 and add it into the result (both exact; before, every texel was 2000 off). |
+ | 16-bit float widening in typed buffer loads | A half NaN in a `buffer_load_format_*` / `tbuffer_load_format_*` load of formats 13 (`16_FLOAT`), 29 (`16_16_FLOAT`) or 71 (`16_16_16_16_FLOAT`) widens to f32 as `sign \| 0x7F800000 \| (payload << 13)`: the sign is kept, the 10-bit payload moves into the f32 mantissa unchanged, and the quiet bit is not forced, so an sNaN stays signalling. Measured natively on RDNA2 (gfx1036, wave32 and wave64, `_x`/`_xy`/`_xyzw`, MUBUF and MTBUF, `tools/f16_widen_probe.py`): 0x7ddb → 0x7fbb6000, 0x7fe6 → 0x7ffcc000, 0x7fbb → 0x7ff76000, 0xffb2 → 0xfff64000, 0x7fcb → 0x7ff96000, 0xff96 → 0xfff2c000, 0x7c01 → 0x7f802000, 0xfc01 → 0xff802000, and the controls 0x3c00 → 0x3f800000, 0xc000 → 0xc0000000. `v_cvt_f32_f16` (what a driver lowers `UnpackHalf2x16` to) differs on an sNaN, which it quiets with the payload kept (0x7ddb → 0x7ffb6000), and `UnpackHalf2x16`'s NaN result is undefined; the mini interpreter canonicalised it to 0x7fc00000. Until 2026-11-23 `Gen.decode_format` used `UnpackHalf2x16` for every half and so lost NaN payloads on all three formats; it now keeps `UnpackHalf2x16` for the non-NaN halves (an exact widening) and builds the NaN word from the bits with integer ops. `tools/mem_diff.py`'s reference was right only on Python 3.14 (its `struct` `'<e'` keeps the payload from 3.14 and canonicalises before); it now uses the same bit-level `f16_to_f32`, so the fuzzer is version independent. Checked by `tests/semantic/test_buffer_f16_widen_hw.py` (the ten measured words, MUBUF and MTBUF, 13/29/71, absent MTBUF channels) and `tools/mem_diff.py --self-test`; 10,500 generated `mem_diff` programs across seeds 1, 2, 3, 7, 11, 21, 22 and 23 match. |
+ | Float-to-int saturation | `v_cvt_u32_f32` and `v_cvt_i32_f32` truncate toward zero, saturate out-of-range values (including infinities) to the destination bounds, and return zero for NaN. The conversion operand is kept in range before emitting SPIR-V `OpConvertFToU`/`OpConvertFToS`. Source: AMD [RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf), §12.8, VOP1 opcodes 7 and 8. The synthetic `cs_cvt_f32_sat.asm` fixture is checked bit-for-bit by `tests/semantic/test_float_to_int.py`. |
+ | `v_cvt_f16_u16`, `v_cvt_f16_i16`, `v_cvt_u16_f16`, `v_cvt_i16_f16` | Conversions of the low 16-bit half (`op_sel:[src,dst]` picks the high half of the source / of the destination in the VOP3 form where supported; GFX10 does not accept `op_sel` on these opcodes); the other half of the destination is kept, like the other 16-bit-result ops (see *16-bit results*). `v_cvt_f16_u16` / `v_cvt_f16_i16` convert the unsigned / sign-extended half and narrow with the usual f16 rounding (65520 and above give +infinity for the unsigned form). `v_cvt_u16_f16` / `v_cvt_i16_f16` truncate toward zero, saturate to [0, 65535] / [-32768, 32767] (an f16 infinity too) and give 0 for NaN, as the 32-bit conversions do (*Float-to-int saturation*). `clamp` and the output multipliers are rejected as `Unsupported` rather than guessed. Source: the AMD [RDNA 2 ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf) pseudocode. Checked on the CPU by `tests/semantic/test_alu_cvt_16.py`; **hardware-verified on RDNA2** (`gfx1035`, wave32 and wave64 via `tools/int_hw_probe.py --oracle both`, SHADER-137): all four `_e64` forms keep the high half of the destination, `v_cvt_u16/i16_f16` give 0 for ±qNaN and saturate ±inf, and `v_cvt_f16_u16(65520)` gives +inf (`0x7c00`). Not run on the shader corpus. |
+diff --git a/tests/semantic/test_image_load_tfe_status.py b/tests/semantic/test_image_load_tfe_status.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..410cc5b96ab015b96852a23a028c324a4b0727d2
+--- /dev/null
++++ b/tests/semantic/test_image_load_tfe_status.py
+@@ -0,0 +1,68 @@
++"""SHADER-1266: with tfe (or lwe) an image_load returns the fetch status in the dword after its data.
++
++RDNA2 ISA, MIMG TFE/LWE: the data takes popcount(dmask) VGPRs (half that, rounded up, under d16) and the status follows
++in the next one. The translator binds only fully resident resources, so it writes 0 there; without tfe/lwe the next
++VGPR is not touched. The GPU check is runtime/test/shaders/cs_imgload_tfe.asm and cs_imgload_d16_tfe.asm (exact on
++llvmpipe). Hand-written programs only; no game data.
++"""
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++import support
++
++SPIRV_AS = shutil.which("spirv-as")
++SPIRV_VAL = shutil.which("spirv-val")
++
++
++def program(vdata, mods):
++    # The would-be status VGPR holds 1000 before the load, so a stale status is visible in the store list.
++    hi = vdata[1]
++    return [f"v_mov_b32_e32 v{hi}, 1000",
++            f"image_load v[{vdata[0]}:{hi}], v[1:2], s[16:23] {mods} dim:SQ_RSRC_IMG_2D unorm",
++            f"exp mrt0 v{vdata[0]}, v{hi}, v{hi}, v{hi} done vm",
++            "s_endpgm"]
++
++
++def stores(spvasm, reg):
++    return [line.split()[-1] for line in spvasm.splitlines() if line.strip().startswith(f"OpStore %reg_v{reg} ")]
++
++
++class ImageLoadTfeStatus(unittest.TestCase):
++    CASES = (  # (dmask, d16, first data VGPR, status VGPR)
++        (0x1, False, 7, 8), (0x3, False, 7, 9), (0x7, False, 7, 10), (0xF, False, 7, 11),
++        (0x1, True, 7, 8), (0x3, True, 7, 8), (0x7, True, 7, 9), (0xF, True, 7, 9),
++    )
++
++    def test_status_dword_is_zero_after_the_data(self):
++        for dmask, d16, first, status in self.CASES:
++            for flag in ("tfe", "lwe"):
++                mods = f"dmask:{dmask:#x} {flag}" + (" d16" if d16 else "")
++                with self.subTest(mods=mods):
++                    spvasm = support.translate_lines("ps_tfe_status", program((first, status), mods))
++                    self.assertEqual(stores(spvasm, status), ["%c3e8", "%c0"])
++
++    def test_without_tfe_the_next_vgpr_keeps_its_value(self):
++        for dmask, d16, first, status in self.CASES:
++            mods = f"dmask:{dmask:#x}" + (" d16" if d16 else "")
++            with self.subTest(mods=mods):
++                spvasm = support.translate_lines("ps_tfe_status", program((first, status), mods))
++                self.assertEqual(stores(spvasm, status), ["%c3e8"])
++
++    @unittest.skipUnless(SPIRV_AS and SPIRV_VAL, "needs spirv-as and spirv-val")
++    def test_modules_validate(self):
++        for dmask, d16, first, status in self.CASES:
++            mods = f"dmask:{dmask:#x} tfe" + (" d16" if d16 else "")
++            with self.subTest(mods=mods), tempfile.TemporaryDirectory() as tmp:
++                spvasm = support.translate_lines("ps_tfe_status", program((first, status), mods))
++                spv = os.path.join(tmp, "m.spv")
++                subprocess.run([SPIRV_AS, "--target-env", "vulkan1.2", "-o", spv, "-"], input=spvasm, text=True,
++                               check=True)
++                r = subprocess.run([SPIRV_VAL, "--target-env", "vulkan1.2", spv], capture_output=True, text=True)
++                self.assertEqual(r.returncode, 0, r.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_mesh_alloc_single_writer.py b/tests/test_mesh_alloc_single_writer.py
+index f11b7da491c8edb9d4f5ed90f073d638e8e66e83..cef163842bfc68035a26781a780e28660730b2a2 100644
+--- a/tests/test_mesh_alloc_single_writer.py
++++ b/tests/test_mesh_alloc_single_writer.py
+@@ -8,7 +8,12 @@ import spirv_asm
+ 
+ class MeshAllocSingleWriterTests(unittest.TestCase):
+     def test_ms_alloc_req_single_writer_guard(self):
+-        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to local_index == 0."""
++        """s_sendmsg(MSG_GS_ALLOC_REQ) writes %ms_counts race-free from whichever wave sends it.
++
++        SHADER-766 made the write race-free by letting only local_index 0 store it, but a shader may send ALLOC_REQ
++        from another wave only (runtime/test/shaders/ms_wave_info_s3.asm), and then the counts stayed 0 and nothing
++        was drawn (#6172). Every invocation that sends the message now stores the uniform m0 with a relaxed
++        Workgroup-scope OpAtomicStore: atomics do not race, and nothing ties the write to invocation 0."""
+         for mesh_compute in (False, True):
+             orig_mc = rdna2spirv.MESH_COMPUTE
+             try:
+@@ -24,21 +29,15 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
+                 gen._insn(ins)
+ 
+                 body_text = "\n".join(gen.body)
+-                # 1. OpStore %ms_counts must be present
+-                self.assertIn("OpStore %ms_counts", body_text)
+-
+-                # 2. Must load %local_index and compare to 0
+-                self.assertIn("= OpLoad %uint %local_index", body_text)
+-                self.assertRegex(body_text, r"%(\w+) = OpIEqual %bool %(\w+) %c0")
+-
+-                # 3. Must have structured selection merge and conditional branch
+-                self.assertRegex(body_text, r"OpSelectionMerge %(\w+) None\s+OpBranchConditional %(\w+) %(\w+) %(\w+)")
+-
+-                # 4. OpStore %ms_counts must only appear inside the conditional block
+-                lines = [l.strip() for l in gen.body if l.strip()]
+-                store_idx = next(i for i, l in enumerate(lines) if "OpStore %ms_counts" in l)
+-                branch_cond_idx = next(i for i, l in enumerate(lines) if "OpBranchConditional" in l)
+-                self.assertGreater(store_idx, branch_cond_idx)
++                # 1. The counts are written with an atomic store of m0, Workgroup scope (2), Relaxed (0).
++                self.assertIn("= OpLoad %uint %m0", body_text)
++                self.assertRegex(body_text, r"OpAtomicStore %ms_counts %c2 %c0 %\w+")
++                # 2. No plain store: two waves storing at once would be SharedMemoryDataRace-RaceOnStore.
++                self.assertNotIn("OpStore %ms_counts", body_text)
++                # 3. Not tied to one invocation or one wave.
++                self.assertNotIn("%local_index", body_text)
++                self.assertNotIn("OpBranchConditional", body_text)
++                self.assertTrue(gen.ms_alloc)
+ 
+                 # 5. Verify assembly into a complete module passes spirv_asm
+                 # Build mock header
+@@ -53,6 +52,7 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
+                     "%bool = OpTypeBool",
+                     "%uint = OpTypeInt 32 0",
+                     "%c0 = OpConstant %uint 0",
++                    "%c2 = OpConstant %uint 2",
+                     "%_ptr_Input_uint = OpTypePointer Input %uint",
+                     "%_ptr_Workgroup_uint = OpTypePointer Workgroup %uint",
+                     "%_ptr_Function_uint = OpTypePointer Function %uint",
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 74d37961f6529f253eab6aa8741b235d95ca40ed..79ef42ea12419c237fd28430218dcd1cf745d430 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -1588,6 +1588,15 @@ class Gen:
+         self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
+         self.uses_active = True
+ 
++    def exec_half_bit(self, val):
++        """This lane's bit of a 32-bit EXEC-half value, as a uint 0 or 1: (val >> (lane & 31)) & 1. Shift and mask,
++        not OpBitFieldUExtract (see exec_half_write for the Intel driver that takes that offset mod 16)."""
++        sh, shr, bit = self.tmp(), self.tmp(), self.tmp()
++        self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
++        self.emit(f"{shr} = OpShiftRightLogical %uint {val} {sh}")
++        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
++        return bit
++
+     def vcc_half_keeps_mask(self):
+         """Whether the current wave64 vcc_lo / vcc_hi write keeps VCC as a lane mask (put_mask on that half) rather
+         than replacing it with plain scalar data (s_buffer_load_dword vcc_lo, scalar ALU, non-mask constant, ...)."""
+@@ -1609,10 +1618,18 @@ class Gen:
+             val = self.sdwa_dst(a, val)
+         if a["k"] == "special" and a["t"] == "null":
+             return                                    # result discarded
+-        if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
+-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
++        if a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi") and (self.wave64 or a["t"] == "exec_lo"):
++            # SHADER-1264: a 32-bit result written to an EXEC half turns on the lanes whose bit is set. `val` is
++            # either a scalar number (the same in every invocation: s_lshl_b32 exec_lo, 1, s5) or a lane mask
++            # (0 or ~0 per invocation), and lane L taking bit L mod 32 is exact for both. Testing the value for
++            # non-zero turned on the whole half for any number but 0. GPU-checked: cs_w32/w64_exec_computed.asm.
++            bit = self.exec_half_bit(val)
++            if self.wave64:
++                self.exec_half_write(1 if a["t"] == "exec_hi" else 0, bit)
++            else:
++                self.set_exec(bit)
+             return
+-        if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
++        if a["k"] == "special" and a["t"] == "exec":
+             self.set_exec(val)
+             return
+         if a["k"] == "vgpr" and a.get("n", 1) == 1:
+@@ -7385,20 +7402,15 @@ class Gen:
+                 raise Unsupported("gs sendmsg " + t)
+             return
+         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
+-            # SHADER-766: only invocation 0 stores the workgroup counts to avoid SharedMemoryDataRace-RaceOnStore.
+-            # The counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
++            # Every invocation that sends the message stores the workgroup counts, with a relaxed atomic store:
++            # the counts are uniform (SGPR m0), atomics do not race (SHADER-766's SharedMemoryDataRace-RaceOnStore),
++            # and the post-alloc barrier makes the value visible to the epilogue's load. SHADER-766 let only
++            # invocation 0 store them, but a shader may send ALLOC_REQ from another wave only
++            # (ms_wave_info_s3.asm: wave 1 sends it, wave 0 skips it), and then the counts stayed 0 and
++            # SetMeshOutputsEXT drew nothing (llvmpipe every time; RADV and AMD's driver now and then, #6172).
+             m = self.tmp()
+             self.emit(f"{m} = OpLoad %uint %m0")
+-            li = self.local_index()
+-            is_lead = self.tmp()
+-            self.emit(f"{is_lead} = OpIEqual %bool {li} {self.cu(0)}")
+-            do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
+-            self.emit(f"OpSelectionMerge {end_lbl} None")
+-            self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")
+-            self.emit(f"{do_lbl} = OpLabel")
+-            self.emit(f"OpStore %ms_counts {m}")
+-            self.emit(f"OpBranch {end_lbl}")
+-            self.emit(f"{end_lbl} = OpLabel")
++            self.emit(f"OpAtomicStore %ms_counts {self.cu(2)} {self.cu(0)} {m}")   # Workgroup scope, Relaxed
+             self.ms_alloc = True
+             return
+         if op == "s_sendmsg" and a and "MSG_ORDERED_PS_DONE" in a[0].get("t", ""):
+@@ -13237,9 +13249,10 @@ class Gen:
+                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
+             if coherent:
+                 self.image_load_coherent(view_dim, self.sgpr_word(a[2], 1), iv, img_idx, dmask, vdata, d16)
+-                return
+-            self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
+-                                  dmask, vdata, self.cu(0), d16)
++            else:
++                self.image_load_typed(view_dim, self.sgpr_word(a[2], 1), iv, img, img_idx,
++                                      dmask, vdata, self.cu(0), d16)
++            self.image_load_status(vdata, dmask, d16, mods)
+             return
+         else:
+             smp_idx = self.desc_lookup_sgpr(a[3], 4)
+@@ -13691,6 +13704,20 @@ class Gen:
+             self.emit(f"{half} = OpExtInst %uint %glsl UMin {bits} {self.cu(0xFFFF)}")
+         return half
+ 
++    def image_load_status(self, vdata, dmask, d16, mods):
++        """SHADER-1266: with tfe (or lwe) an MIMG read returns one more dword after its data, the fetch status, in
++        vdata[data dwords] (RDNA2 ISA, MIMG TFE/LWE): popcount(dmask) data dwords, half that rounded up under d16.
++        The translator binds only fully resident, non-sparse resources, so the status is 0 for every texel. Masked by
++        EXEC like any VALU write. GPU fixtures: cs_imgload_tfe.asm, cs_imgload_d16_tfe.asm."""
++        if not any(m in mods for m in ("tfe", "lwe")):
++            return
++        if vdata["k"] != "vgpr":
++            raise Unsupported("image_load tfe data")
++        n = bin(dmask & 0xF).count("1") or 1
++        if d16:
++            n = (n + 1) // 2
++        self.dst({"k": "vgpr", "r": vdata["r"] + n, "n": 1}, self.cu(0))
++
+     def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata, lod, d16=False):
+         def fetch(image, _cls, ty):
+             res = self.tmp()
+
+From 7b8b4bea60cfae50564b82716febae20c1e9f38f Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:39:31 +0000
+Subject: [PATCH 4/7] fix: restore hardware audio context sizes
+
+Source: luizwidmer/Leonida-work at 7d61424381ea69e7422cd98e13ee2b682a58d055. Includes the original padding changes and comments.
+
+diff --git a/runtime/shims/acphal.cpp b/runtime/shims/acphal.cpp
+index 553f57f2072a619a8b7e7f0deeeb0ad3fd4f6b32..02dc650575e3c73c580ca75faac86762bf04541f 100644
+--- a/runtime/shims/acphal.cpp
++++ b/runtime/shims/acphal.cpp
+@@ -141,7 +141,8 @@ struct SHAPE_XMA_CONTEXT {
+     uint32_t reserved1 : 6;
+     uint32_t loopStartOffset : 26;
+     uint32_t loopEndOffset : 6;
+-    uint32_t reserved[10];
++    // The bitfields above fill 15 dwords; the 64-byte width the assert below states needs 16.
++    uint32_t reserved[11];
+ };
+ static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
+ 
+@@ -162,7 +163,8 @@ struct SHAPE_PCM_CONTEXT {
+     uint32_t reserved6 : 15;
+     uint32_t format : 2;
+     uint32_t reserved7 : 14;
+-    uint32_t reserved[1];
++    // The fields above fill 7 dwords; the 32-byte width the assert below states needs 8.
++    uint32_t reserved[2];
+ };
+ static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE_PCM_CONTEXT is 32 bytes per GDK");
+ 
+
+From 28cd1ce7d2797dc1d8865fd7961f590af790eddf Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:39:31 +0000
+Subject: [PATCH 5/7] fix: route addressed descriptor heaps through their
+ device
+
+Builds on the slot 14 routing and test in Vyzerythe/Leonida PR 12. The per-device callback and COM ownership checks are local changes.
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index c16201f6a06eb6c5edfd0076751214718438b6d0..fabec62559d807798e5dcfcf792cd384d888c759 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -5943,6 +5943,11 @@ public:
+ 
+     HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid,
+                                                    void** out) override {
++        return create_descriptor_heap(desc, 0, 0, riid, out);
++    }
++
++    HRESULT create_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC* desc, D3D12_GPU_VIRTUAL_ADDRESS address,
++                                   std::uint64_t size, REFIID riid, void** out) {
+         constexpr auto method = "ID3D12Device::CreateDescriptorHeap";
+         if (out) *out = nullptr;
+         if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+@@ -5956,7 +5961,7 @@ public:
+             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
+             return d3d12_trace::result(method, E_INVALIDARG);
+         }
+-        auto* heap = new DescriptorHeap(state_, *desc);
++        auto* heap = new DescriptorHeap(state_, *desc, address, size);
+         heap->attach_device(identity());
+         if (!heap->ok()) {
+             heap->Release();
+@@ -9989,22 +9994,11 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
+     if (!device || !desc) return E_INVALIDARG;
+     // No output: a capability check, as CreateDescriptorHeap does.
+     if (!out) return S_FALSE;
+-    if ((desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) || desc->NodeMask > 1 ||
+-        ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+-         (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
+-        return E_INVALIDARG;
+-    }
+     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+     auto* d = Device::from<Device>(real ? real : device);
+     if (!d) return E_INVALIDARG;
+ 
+-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
+-    heap->attach_device(d->identity());
+-    if (!heap->ok()) {
+-        heap->Release();
+-        return E_OUTOFMEMORY;
+-    }
+-    return hand_out(heap, riid, out);
++    return d->create_descriptor_heap(desc, console_address, console_size, riid, out);
+ }
+ 
+ std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
+diff --git a/runtime/shims/d3d12_xs.cpp b/runtime/shims/d3d12_xs.cpp
+index 8e54c3fd5600267c069e0ba0816596e83cf48083..71f83b544f28d5340d21716548505e232b09e9d2 100644
+--- a/runtime/shims/d3d12_xs.cpp
++++ b/runtime/shims/d3d12_xs.cpp
+@@ -171,7 +171,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
+                          static_cast<unsigned long>(vhr));
+             return result(method, vhr);
+         }
+-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
++        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, rt::d3d12::create_console_descriptor_heap);
+         if (FAILED(vhr)) {
+             vulkan->Release();
+             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 187406e3d8d55f9019df4e4b59ea18ce47ed1408..3cc2953e5336b46dce4747c0437f1a0ea24e0eb2 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -63,6 +63,7 @@ struct DeviceProxy {
+     // The device's IDXGIDevice1 (see "IDXGIDevice1 on the device" below): a title's IDXGIDevice1* points here.
+     void** dxgi_vtable;
+     DxgiAdapterProvider adapter_provider;
++    ConsoleHeapCreator create_console_heap;
+     std::atomic<int> gpu_thread_priority;
+     std::atomic<unsigned> max_frame_latency;
+     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
+@@ -1590,7 +1591,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
+     void* created = nullptr;
+     HRESULT hr = E_INVALIDARG;
+     bool console_extended = false;
+-    if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
++    if (self->create_console_heap && desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
+         (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
+         const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
+         const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
+@@ -1599,11 +1600,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
+             std::uint64_t size = 0;
+             std::memcpy(&address, tail, sizeof(address));
+             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
+-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
+-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
++            // Xbox slot 14 carries the requested address and size after the PC prefix (issue #313).
+             if (address != 0) {
+                 console_extended = true;
+-                hr = rt::d3d12::create_console_descriptor_heap(
++                hr = self->create_console_heap(
+                     self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                     __uuidof(ID3D12DescriptorHeap), &created);
+             }
+@@ -1962,7 +1962,7 @@ unsigned detect_slot_count(ID3D12Device* real) {
+ 
+ }  // namespace
+ 
+-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
++HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, ConsoleHeapCreator create_console_heap) {
+     if (!real) return E_POINTER;
+     if (!out) return E_POINTER;
+     *out = nullptr;
+@@ -1976,6 +1976,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
+     proxy->refs.store(1, std::memory_order_relaxed);
+     proxy->dxgi_vtable = get_dxgi_vtable();
+     proxy->adapter_provider = nullptr;
++    proxy->create_console_heap = create_console_heap;
+     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
+     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
+ 
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index ac0437215d238c1a2a57a7fe8777495d58b54ea1..879c0a86d823861e9302b59ac55cb29cae123b2e 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -54,10 +54,14 @@
+ 
+ namespace rt::d3d12_xs {
+ 
++// Supplied by the Vulkan backend for Xbox slot 14. Host D3D12 proxies take the PC description.
++using ConsoleHeapCreator = HRESULT (*)(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC*,
++                                      D3D12_GPU_VIRTUAL_ADDRESS, std::uint64_t, REFIID, void**);
++
+ // Wraps `real` and returns the requested device interface through `out`. Takes ownership of one reference to
+ // `real` on success; on failure the caller keeps its reference. Returns E_NOINTERFACE if `riid` is not a D3D12
+ // device interface the PC device implements.
+-HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
++HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, ConsoleHeapCreator create_console_heap = nullptr);
+ 
+ // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
+ bool is_device_proxy(const void* device);
+diff --git a/runtime/test/d3d12_console_descriptor_heap_test.cpp b/runtime/test/d3d12_console_descriptor_heap_test.cpp
+index 5f694b5a2a22fced351ecfac89701435023d14ba..d588cbff8f0366829158cf10cd75ecb16a661fc5 100644
+--- a/runtime/test/d3d12_console_descriptor_heap_test.cpp
++++ b/runtime/test/d3d12_console_descriptor_heap_test.cpp
+@@ -7,24 +7,14 @@
+ #include "../shims/d3d12_com.h"
+ #include "../shims/d3d12_xs_device.h"
+ 
++#include <wrl/client.h>
++
+ #include <cstdint>
+ #include <cstdio>
+ 
+ namespace {
+ 
+-template <class T>
+-struct Ref {
+-    T* p = nullptr;
+-    ~Ref() { if (p) p->Release(); }
+-    T** put() {
+-        if (p) {
+-            p->Release();
+-            p = nullptr;
+-        }
+-        return &p;
+-    }
+-    T* get() const { return p; }
+-};
++using Microsoft::WRL::ComPtr;
+ 
+ bool check_console_addressed_heap(ID3D12Device* device) {
+     D3D12_DESCRIPTOR_HEAP_DESC desc{};
+@@ -35,10 +25,10 @@ bool check_console_addressed_heap(ID3D12Device* device) {
+     const D3D12_GPU_VIRTUAL_ADDRESS address = 0x112233440000ull;
+     const std::uint64_t size = 8ull * 32ull;
+ 
+-    Ref<ID3D12DescriptorHeap> heap;
++    ComPtr<ID3D12DescriptorHeap> heap;
+     const HRESULT hr = rt::d3d12::create_console_descriptor_heap(
+-        device, &desc, address, size, IID_PPV_ARGS(heap.put()));
+-    if (FAILED(hr) || !heap.get()) {
++        device, &desc, address, size, IID_PPV_ARGS(heap.GetAddressOf()));
++    if (FAILED(hr) || !heap.Get()) {
+         std::fprintf(stderr, "create_console_descriptor_heap failed: 0x%08lx\n", static_cast<unsigned long>(hr));
+         return false;
+     }
+@@ -64,13 +54,15 @@ bool check_console_addressed_heap(ID3D12Device* device) {
+ }
+ 
+ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
+-    void* proxy_raw = nullptr;
+-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
++    ComPtr<ID3D12Device> proxy;
++    // The proxy takes one reference on success. The caller retains its own reference.
++    ComPtr<ID3D12Device> owned(real_device);
++    if (FAILED(rt::d3d12_xs::create_device_proxy(owned.Get(), IID_PPV_ARGS(proxy.GetAddressOf()),
++                                                  rt::d3d12::create_console_descriptor_heap))) {
+         std::fprintf(stderr, "create_device_proxy failed\n");
+         return false;
+     }
+-    Ref<ID3D12Device> proxy;
+-    proxy.p = static_cast<ID3D12Device*>(proxy_raw);
++    owned.Detach();
+ 
+     struct ConsoleDescriptorHeapDesc {
+         D3D12_DESCRIPTOR_HEAP_DESC desc{};
+@@ -83,17 +75,21 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
+     console.address = 0x556677880000ull;
+     console.size = 4ull * 32ull;
+ 
+-    Ref<ID3D12DescriptorHeap> heap;
+-    const HRESULT hr = proxy->CreateDescriptorHeap(&console.desc, IID_PPV_ARGS(heap.put()));
+-    if (FAILED(hr) || !heap.get()) {
++    ComPtr<ID3D12DescriptorHeap> heap;
++    const HRESULT hr = proxy->CreateDescriptorHeap(&console.desc, IID_PPV_ARGS(heap.GetAddressOf()));
++    if (FAILED(hr) || !heap.Get()) {
+         std::fprintf(stderr, "proxy CreateDescriptorHeap(console) failed: 0x%08lx\n",
+                      static_cast<unsigned long>(hr));
+         return false;
+     }
+-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+-    if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
+-        std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
+-                     static_cast<unsigned long long>(cpu.ptr),
++    // The proxy returns each handle in RAX, as the Xbox caller expects.
++    using GetHandle = std::uint64_t (WINAPI*)(ID3D12DescriptorHeap*);
++    void** slots = *reinterpret_cast<void***>(heap.Get());
++    const auto cpu = reinterpret_cast<GetHandle>(slots[9])(heap.Get());
++    const auto gpu = reinterpret_cast<GetHandle>(slots[10])(heap.Get());
++    if (cpu != console.address || gpu != console.address) {
++        std::fprintf(stderr, "proxy heap starts: CPU 0x%llx GPU 0x%llx expected 0x%llx\n",
++                     static_cast<unsigned long long>(cpu), static_cast<unsigned long long>(gpu),
+                      static_cast<unsigned long long>(console.address));
+         return false;
+     }
+@@ -105,9 +101,9 @@ bool check_normal_heap_unchanged(ID3D12Device* device) {
+     desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+     desc.NumDescriptors = 4;
+     desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+-    Ref<ID3D12DescriptorHeap> heap;
+-    const HRESULT hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(heap.put()));
+-    if (FAILED(hr) || !heap.get()) {
++    ComPtr<ID3D12DescriptorHeap> heap;
++    const HRESULT hr = device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(heap.GetAddressOf()));
++    if (FAILED(hr) || !heap.Get()) {
+         std::fprintf(stderr, "CreateDescriptorHeap(normal) failed: 0x%08lx\n", static_cast<unsigned long>(hr));
+         return false;
+     }
+@@ -127,7 +123,7 @@ int main() {
+     if (status == vktest::DeviceStatus::unavailable) return 77;
+     if (status != vktest::DeviceStatus::ready) return 1;
+ 
+-    Ref<ID3D12Device> device;
++    ComPtr<ID3D12Device> device;
+     rt::d3d12::VulkanDeviceInfo info{};
+     info.get_instance_proc = vk.instance_proc;
+     info.instance = vk.instance;
+@@ -135,14 +131,14 @@ int main() {
+     info.device = vk.device;
+     info.queue = vk.queue;
+     info.queue_family = vk.family;
+-    if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(device.put()))) || !device.get()) {
++    if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(device.GetAddressOf()))) || !device.Get()) {
+         std::fprintf(stderr, "create_vulkan_device failed\n");
+         return 1;
+     }
+ 
+-    if (!check_normal_heap_unchanged(device.get())) return 1;
+-    if (!check_console_addressed_heap(device.get())) return 1;
+-    if (!check_xs_proxy_slot14(device.get())) return 1;
++    if (!check_normal_heap_unchanged(device.Get())) return 1;
++    if (!check_console_addressed_heap(device.Get())) return 1;
++    if (!check_xs_proxy_slot14(device.Get())) return 1;
+     std::fprintf(stderr, "ok\n");
+     return 0;
+ }
+
+From 21e0f27001be96e6953c35a13d3cc595e5002a42 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:39:31 +0000
+Subject: [PATCH 6/7] test: restore image atomic guard coverage for nested
+ regions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Source: Kauê (ykauttiz), Vyzerythe/Leonida PR 13 at 123a1bfdc752176ed78ed5b585c7eb087abfcf7d.
+
+diff --git a/tests/semantic/test_image_atomics_guard.py b/tests/semantic/test_image_atomics_guard.py
+index c769038bbf9e334b889e47489ca8f4ecf7cd488c..5ed1cf121ee343be01adcf52233479699a9fd133 100644
+--- a/tests/semantic/test_image_atomics_guard.py
++++ b/tests/semantic/test_image_atomics_guard.py
+@@ -74,24 +74,84 @@ def parse_blocks(spv):
+ 
+ 
+ def find_guarded_texel_block(spv):
+-    """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
+-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
++    """Prove every image-atomic texel pointer is dominated by the active-true path.
++
++    OpSelectionMerge guards a *region*, not necessarily a single block. An
++    inc/dec CAS lowering nests a loop inside that region, so the pointer is
++    legitimately in the loop body rather than the guard's direct true target.
++    Compute CFG dominators instead of requiring a direct branch target.
++    """
+     blocks = parse_blocks(spv)
+     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
++    successors = {}
++    for label, insns in blocks.items():
++        targets = []
++        if insns:
++            term = insns[-1].split()
++            if term[0] == "OpBranch" and len(term) >= 2:
++                targets = [term[1]]
++            elif term[0] == "OpBranchConditional" and len(term) >= 4:
++                targets = [term[2], term[3]]
++            elif term[0] == "OpSwitch" and len(term) >= 3:
++                targets = [term[2], *term[4::2]]
++        successors[label] = [t for t in targets if t in blocks]
++
++    predecessors = {label: set() for label in blocks}
++    for label, targets in successors.items():
++        for target in targets:
++            predecessors[target].add(label)
++
++    # Multiple shader helper functions may occur in one module. The entry of
++    # each connected component has no incoming CFG edges.
++    roots = {label for label, incoming in predecessors.items() if not incoming}
++    reachable = set(roots)
++    pending = list(roots)
++    while pending:
++        for target in successors[pending.pop()]:
++            if target not in reachable:
++                reachable.add(target)
++                pending.append(target)
++
++    dominators = {label: ({label} if label in roots else set(reachable))
++                  for label in reachable}
++    changed = True
++    while changed:
++        changed = False
++        for label in reachable - roots:
++            incoming = predecessors[label] & reachable
++            if not incoming:
++                continue
++            common = set.intersection(*(dominators[p] for p in incoming))
++            new = {label} | common
++            if new != dominators[label]:
++                dominators[label] = new
++                changed = True
++
++    # With no EXEC-changing instruction the translator marks exec_static_true:
++    # active_b() then returns %true instead of loading %active. Such a
++    # compile-time guard is safe only if this module never stores a dynamic
++    # value to %active; the negative regression below enforces that boundary.
++    dynamic_active_store = re.search(
++        r"^\s*OpStore %active (?!%true(?:\s|$))", spv, re.M
++    ) is not None
+     guarded_targets = set()
+     for insns in blocks.values():
+         for i, ln in enumerate(insns):
+             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
+                 br = insns[i + 1]
+                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
+-                if m and m.group(1) in active_loads:
++                if m and (m.group(1) in active_loads or
++                          (m.group(1) == "%true" and not dynamic_active_store)):
+                     guarded_targets.add(m.group(2))
++
+     found = []
+-    for lbl, insns in blocks.items():
++    for label, insns in blocks.items():
+         if any("= OpImageTexelPointer " in ln for ln in insns):
+-            if lbl not in guarded_targets:
+-                raise AssertionError(f"OpImageTexelPointer in unguarded block {lbl}")
+-            found.append((lbl, insns))
++            if label not in reachable or not any(
++                target in dominators[label] for target in guarded_targets
++            ):
++                raise AssertionError(f"OpImageTexelPointer in unguarded block {label}")
++            found.append((label, insns))
+     if not found:
+         raise AssertionError("No OpImageTexelPointer emitted")
+     return found
+@@ -106,6 +166,93 @@ def vgpr_ptrs(spv, reg_idx):
+     }
+ 
+ 
++class GuardDominanceTests(unittest.TestCase):
++    """Synthetic CFGs to keep the guard checker strict without a GPU."""
++
++    def test_nested_cas_loop_remains_inside_active_guard(self):
++        spv = """
++%entry = OpLabel
++%flag = OpLoad %bool %active
++OpSelectionMerge %merge None
++OpBranchConditional %flag %guarded %merge
++%guarded = OpLabel
++OpBranch %loop
++%loop = OpLabel
++OpLoopMerge %loop_done %loop_next None
++OpBranch %do
++%do = OpLabel
++%ptr = OpImageTexelPointer %ptr_image %img %coords %sample
++OpBranch %loop_next
++%loop_next = OpLabel
++OpBranchConditional %retry %loop %loop_done
++%loop_done = OpLabel
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++"""
++        self.assertEqual([label for label, _ in find_guarded_texel_block(spv)], ["%do"])
++
++    def test_access_after_guard_merge_is_rejected(self):
++        spv = """
++%entry = OpLabel
++%flag = OpLoad %bool %active
++OpSelectionMerge %merge None
++OpBranchConditional %flag %guarded %merge
++%guarded = OpLabel
++OpBranch %merge
++%merge = OpLabel
++%ptr = OpImageTexelPointer %ptr_image %img %coords %sample
++OpReturn
++"""
++        with self.assertRaisesRegex(AssertionError, "unguarded block %merge"):
++            find_guarded_texel_block(spv)
++
++    def test_inactive_branch_access_is_rejected(self):
++        spv = """
++%entry = OpLabel
++%flag = OpLoad %bool %active
++OpSelectionMerge %merge None
++OpBranchConditional %flag %guarded %inactive
++%guarded = OpLabel
++OpBranch %merge
++%inactive = OpLabel
++%ptr = OpImageTexelPointer %ptr_image %img %coords %sample
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++"""
++        with self.assertRaisesRegex(AssertionError, "unguarded block %inactive"):
++            find_guarded_texel_block(spv)
++
++
++    def test_static_true_guard_with_no_exec_write_is_valid(self):
++        spv = """
++%entry = OpLabel
++OpSelectionMerge %merge None
++OpBranchConditional %true %guarded %merge
++%guarded = OpLabel
++%ptr = OpImageTexelPointer %ptr_image %img %coords %sample
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++"""
++        self.assertEqual([name for name, _ in find_guarded_texel_block(spv)], ["%guarded"])
++
++    def test_static_true_guard_cannot_hide_dynamic_exec_write(self):
++        spv = """
++%entry = OpLabel
++OpStore %active %false
++OpSelectionMerge %merge None
++OpBranchConditional %true %guarded %merge
++%guarded = OpLabel
++%ptr = OpImageTexelPointer %ptr_image %img %coords %sample
++OpBranch %merge
++%merge = OpLabel
++OpReturn
++"""
++        with self.assertRaisesRegex(AssertionError, "unguarded block %guarded"):
++            find_guarded_texel_block(spv)
++
+ class ImageAtomicsGuardTests(unittest.TestCase):
+     def test_all_image_atomics_2d_and_3d_guarded_and_valid(self):
+         simple_ops = [
+
+From 02b5c8b3e4e946c7f77ed3b3e6cd55c8d670544f Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:39:55 +0000
+Subject: [PATCH 7/7] test: check true edges when verifying image atomic guards
+
+
+diff --git a/tests/semantic/test_image_atomics_guard.py b/tests/semantic/test_image_atomics_guard.py
+index 5ed1cf121ee343be01adcf52233479699a9fd133..b5c117c89f4351f32ca0fd2ba057e0468fc7c7f4 100644
+--- a/tests/semantic/test_image_atomics_guard.py
++++ b/tests/semantic/test_image_atomics_guard.py
+@@ -79,7 +79,7 @@ def find_guarded_texel_block(spv):
+     OpSelectionMerge guards a *region*, not necessarily a single block. An
+     inc/dec CAS lowering nests a loop inside that region, so the pointer is
+     legitimately in the loop body rather than the guard's direct true target.
+-    Compute CFG dominators instead of requiring a direct branch target.
++    Remove the active-true edges and check which blocks an inactive path can still reach.
+     """
+     blocks = parse_blocks(spv)
+     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+@@ -96,36 +96,18 @@ def find_guarded_texel_block(spv):
+                 targets = [term[2], *term[4::2]]
+         successors[label] = [t for t in targets if t in blocks]
+ 
+-    predecessors = {label: set() for label in blocks}
+-    for label, targets in successors.items():
+-        for target in targets:
+-            predecessors[target].add(label)
+-
+-    # Multiple shader helper functions may occur in one module. The entry of
+-    # each connected component has no incoming CFG edges.
+-    roots = {label for label, incoming in predecessors.items() if not incoming}
+-    reachable = set(roots)
+-    pending = list(roots)
+-    while pending:
+-        for target in successors[pending.pop()]:
+-            if target not in reachable:
+-                reachable.add(target)
+-                pending.append(target)
+-
+-    dominators = {label: ({label} if label in roots else set(reachable))
+-                  for label in reachable}
+-    changed = True
+-    while changed:
+-        changed = False
+-        for label in reachable - roots:
+-            incoming = predecessors[label] & reachable
+-            if not incoming:
+-                continue
+-            common = set.intersection(*(dominators[p] for p in incoming))
+-            new = {label} | common
+-            if new != dominators[label]:
+-                dominators[label] = new
+-                changed = True
++    roots = blocks.keys() - {target for targets in successors.values() for target in targets}
++
++    def reachable_without(excluded_edges):
++        seen = set(roots)
++        pending = list(roots)
++        while pending:
++            label = pending.pop()
++            for target in successors[label]:
++                if target not in seen and (label, target) not in excluded_edges:
++                    seen.add(target)
++                    pending.append(target)
++        return seen
+ 
+     # With no EXEC-changing instruction the translator marks exec_static_true:
+     # active_b() then returns %true instead of loading %active. Such a
+@@ -134,22 +116,21 @@ def find_guarded_texel_block(spv):
+     dynamic_active_store = re.search(
+         r"^\s*OpStore %active (?!%true(?:\s|$))", spv, re.M
+     ) is not None
+-    guarded_targets = set()
+-    for insns in blocks.values():
++    guarded_edges = set()
++    for label, insns in blocks.items():
+         for i, ln in enumerate(insns):
+             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
+                 br = insns[i + 1]
+                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
+-                if m and (m.group(1) in active_loads or
++                if m and m.group(2) != m.group(3) and (m.group(1) in active_loads or
+                           (m.group(1) == "%true" and not dynamic_active_store)):
+-                    guarded_targets.add(m.group(2))
++                    guarded_edges.add((label, m.group(2)))
+ 
++    guarded_blocks = reachable_without(set()) - reachable_without(guarded_edges)
+     found = []
+     for label, insns in blocks.items():
+         if any("= OpImageTexelPointer " in ln for ln in insns):
+-            if label not in reachable or not any(
+-                target in dominators[label] for target in guarded_targets
+-            ):
++            if label not in guarded_blocks:
+                 raise AssertionError(f"OpImageTexelPointer in unguarded block {label}")
+             found.append((label, insns))
+     if not found:
+@@ -169,6 +150,21 @@ def vgpr_ptrs(spv, reg_idx):
+ class GuardDominanceTests(unittest.TestCase):
+     """Synthetic CFGs to keep the guard checker strict without a GPU."""
+ 
++    def test_false_edge_can_also_reach_true_target(self):
++        spv = """
++%entry = OpLabel
++%flag = OpLoad %bool %active
++OpSelectionMerge %merge None
++OpBranchConditional %flag %merge %inactive
++%inactive = OpLabel
++OpBranch %merge
++%merge = OpLabel
++%ptr = OpImageTexelPointer %ptr_image %img %coords %sample
++OpReturn
++"""
++        with self.assertRaisesRegex(AssertionError, "unguarded block %merge"):
++            find_guarded_texel_block(spv)
++
+     def test_nested_cas_loop_remains_inside_active_guard(self):
+         spv = """
+ %entry = OpLabel

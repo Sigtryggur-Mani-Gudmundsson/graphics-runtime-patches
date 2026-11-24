@@ -1,0 +1,50 @@
+RTX 4070 Ti shader restoration results
+24 November 2026 UTC
+
+GPU         NVIDIA GeForce RTX 4070 Ti, subgroup 32
+Driver      NVIDIA 620.70.06, Vulkan 1.4.357, CachyOS Linux
+Tools       LLVM 23.1.5, SPIRV-Tools v2026.4, GNU C++ 16.2.1
+Headers     Khronos Vulkan-Headers commit 6802bb4733b63ed5efd3adb308a6c885ef180ea1
+Base        de4c37383cad386eaa851047628d7b92c51009c5
+Candidate   simomistralii/Leonida-PC PR #2, source head 1de36398c44b9f922645533ee63e1b40d1f8e095
+Scope       Three changes in tools/rdna2spirv.py, their tests and design notes.
+            The same native Linux harness binaries were used throughout.
+            All inputs were the project's hand-written fixtures.
+
+Full scripts/run_gpu_tests.py suite
+                                      Pass   Skip   Fail    Translated and SPIR-V validated
+Base, native                           195     49      4    255/255
+Patched, native                        199     49      0    255/255
+Patched, LEONIDA_W64_EMULATE=1          231     17      0    255/255
+
+The four baseline failures all passed with the backport:
+* cs_imgload_tfe and cs_imgload_d16_tfe (status after a resident image load)
+* cs_w32_exec_computed (lane selection for computed EXEC writes)
+* ms_wave_info_s3 (a mesh allocation sent by wave 1)
+
+The baseline native mesh draw left all 4096 pixels at the clear value (-1,-1,-1,-1).
+The patched native and emulated draws returned the expected gradient. Three
+additional native draws per revision, alternating baseline and patched modules,
+reproduced the all-clear baseline and exact patched result every time. Every
+RGBA32F component matched the expected float32 value for its pixel.
+
+The patched wave32 compute output was 259 1028 3088 7682 512 4100 0 3.
+With software wave64 emulation, cs_w64_exec_computed produced
+291 1028 11264 771 8192 4132 0 3. The device cannot run native 64-wide subgroups.
+
+Five native CTests passed: depth24_convert, vk_command_replay,
+vk_overlapping_occlusion, vk_overlapping_occlusion_no_statistics and
+vk_bc_zero_init. A control draw with the repository's vs_tri.vert and fs_solid.frag
+returned the expected color at all 4096 pixels.
+
+Reproduce each full run in a fresh --work directory:
+  python -I scripts/run_gpu_tests.py --require-pass --build <native-build> --work <fresh-directory>
+For the emulated run, set LEONIDA_W64_EMULATE=1. The hardware tests used a
+25-second per-program timeout. The accompanying patch applies with git apply at
+the base SHA above. No retail game, Windows D3D12 layer or presenter was tested.
+
+Original changes (commits authored as Claude in simomistralii's fork):
+  https://github.com/simomistralii/Leonida-PC/commit/65d5201fd3927551574af221022fc6ec64a783c1
+  https://github.com/simomistralii/Leonida-PC/commit/ad0fb49cbbae399a2305a19566c1959d4bcba4e5
+  https://github.com/simomistralii/Leonida-PC/commit/14e2312774700a09b5746d1f479170c531f74842
+AI-assisted verification.

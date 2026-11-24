@@ -1,0 +1,52 @@
+Leonida synthetic Windows graphics tests | 2026-11-24 UTC
+
+Environment: Wine 11.22 on Linux, NVIDIA GeForce RTX 4070 Ti.
+Guest fixture source: de4c37383cad386eaa851047628d7b92c51009c5.
+Windows loader and presentation tests: cached ItsNotRexed/Leonida Actions
+artifact 14852824058. The loader SHA-256 was
+0f7cb58396dea47fdcbc7b98eeb7343c40f1b8580481a576c1fd81c842f12945.
+The artifact's source revision could not be verified. The guest fixture
+revision identifies the source-built guests only.
+
+tiny_frame: The source-built guest and the cached CI guest both passed via
+gta6rt.exe --run with --trace-d3d12. All 32 readback pixels matched RGBA
+(64,128,191,255).
+
+tiny_guest_draw: Built the M1.5 guest with LLVM-MinGW and the fixture's
+d3d12_xs import library. Generated vs_m15 and ps_m15 using the fixture
+shader build.py, pointed LEONIDA_SHADERS at its spirv directory, and
+passed the fixture directory to the guest. The Xbox D3D12 proxy issued
+three draws. Of 4096 pixels, 4064 matched exactly and the remaining 32
+were permitted clear-colour edge pixels. Both guest and loader exited 0.
+
+d3d12_present_test: On a private KWin virtual Wayland display the test
+presented 70 frames, confirmed the colours by swapchain readback, and
+recreated the swapchain on resize. Wine skipped desktop pixel sampling.
+
+xbox_present_test: Compositing, resizing, and pacing checks reached the
+final minimization case. The test failed its skipped_presents > 0 check.
+It displayed 30 frames in 501 ms and skipped zero during the minimize
+request. An independent Win32 probe in the same display configuration
+observed IsIconic == 0 after SW_MINIMIZE, with the client still 312x213.
+Minimized-window behavior therefore remains unverified. An XWayland
+comparison initially had no DISPLAY and skipped (exit 77).
+
+Follow-up with kwin_wayland_wrapper providing a verified private XWayland
+display: the Win32 probe measured 312x213, then IsIconic == 1 and 0x0 on
+minimize, then 312x213 again on restore. The unmodified xbox_present_test
+passed on this display. It skipped two of three minimized presents and
+successfully showed the restored frame.
+
+Separate source regression: when Vulkan's surface capabilities report
+an undefined currentExtent, the presenter treated a measured 0x0 like
+a failed client-size query. vk_presenter_sync_test compiled from de4c373
+with the regression case failed as the presented counter advanced. With
+presenter-zero-client-extent.patch, an unavailable size kept its previous
+extent, two zero-sized frames produced no presents or stale readbacks,
+and restoring the previous size recovered the expected image colour.
+The full source-built vk_presenter_sync_test passed on Wine/XWayland.
+This case uses an injected surface capability and a controlled client
+extent, with real Vulkan swapchain, synchronization and pixel readback.
+
+These fixtures exercise the loader, translated graphics and presentation.
+They do not establish the cause of a retail title's black screen.
