@@ -1,0 +1,191 @@
+From 25beeda27efd58d6164befb4807387ace933dd59 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 02:57:44 +0000
+Subject: [PATCH] Match vertex shader aliases by the pipeline container input
+ signature
+
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 62d2457d67a1ad04a74a87686a8a39ca4f224495..3bdf64382a2994082a8d4a877ce1f79f2cac5047 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2026,6 +2026,12 @@ build emits that hash for every translation; the runtime extracts the FSSM chunk
+ way `tools/fssm_unpack.py` does. The current `spirv/index.json` is keyed by carve name, which the runtime may not
+ have; add the content hash to the index.
+ 
++Several vertex shaders can share that payload and fit the same D3D input layout while assigning its semantics
++to different registers. When the supplied DXBC has an ISG1 chunk, the runtime first selects candidates whose
++recorded input signature matches the chunk, including the registers, component types and masks. The usual
++layout and binding preferences still apply within that group. Bare programs and older indexes with incomplete
++signatures retain the layout-based lookup.
++
+ Pipeline creation:
+ 
+ - `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 431858635b4d9498fe45877e4cc814484495e753..e9b702ab586563ed33865be163d3aaea55c0efbe 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -3522,8 +3522,9 @@ public:
+                                                 desc.RasterizerState.DepthBiasClamp};
+         for (Stage& stage : stages) {
+             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
+-            stage.fssm = leonida::fssm_program(
+-                {static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength});
++            const std::span bytecode(static_cast<const std::uint8_t*>(stage.code.pShaderBytecode),
++                                     stage.code.BytecodeLength);
++            stage.fssm = leonida::fssm_program(bytecode);
+             if (stage.fssm.empty()) {
+                 log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
+                 return E_INVALIDARG;
+@@ -3532,7 +3533,7 @@ public:
+             // Containers with the same program can differ in their input signature or bindings: a VS must have its
+             // inputs fed by this input layout (else the layout check below reports it).
+             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
+-            stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
++            stage.entry = pick_entry(library->candidates(stage.name, hash, bytecode), [&](const leonida::ShaderEntry& e) {
+                 return !vertex || layout_feeds(e, desc.InputLayout);
+             });
+             if (!stage.entry) {
+diff --git a/runtime/src/shader_library.h b/runtime/src/shader_library.h
+index 352e54325ceaa01c1f83b4f9f7075411247ee66d..6bdab2d01c8a0b830558dc9dec138e29a41d78d0 100644
+--- a/runtime/src/shader_library.h
++++ b/runtime/src/shader_library.h
+@@ -786,8 +786,39 @@ struct SignatureElement {
+     std::uint32_t register_index = 0;
+     std::uint32_t system_value = 0;  // 0: an ordinary input fed by the input layout
+     std::string component_type;      // "float", "uint", "sint"
++    std::uint32_t mask = UINT32_MAX, rw_mask = UINT32_MAX;  // absent in some older indexes
+ };
+ 
++// Compare the same ISG1 fields shader_meta.py recorded. Names in the chunk are offsets from its beginning.
++inline bool matches_isg1(const std::vector<SignatureElement>& inputs, std::span<const std::uint8_t> chunk) {
++    if (chunk.size() < 8 || inputs.empty()) return false;
++    const auto u32 = [&](std::size_t offset) {
++        std::uint32_t value;
++        std::memcpy(&value, chunk.data() + offset, sizeof(value));
++        return value;
++    };
++    const std::size_t count = u32(0), table = u32(4);
++    constexpr std::size_t stride = 32;
++    if (count != inputs.size() || table < 8 || table > chunk.size() || count > (chunk.size() - table) / stride)
++        return false;
++    const std::size_t strings = table + count * stride;
++    for (std::size_t i = 0; i < count; ++i) {
++        const auto& input = inputs[i];
++        const std::size_t row = table + i * stride, name = u32(row + 4);
++        if (name < strings || name >= chunk.size() || input.semantic.empty() ||
++            input.semantic.size() >= chunk.size() - name || chunk[name + input.semantic.size()] != 0 ||
++            std::memcmp(chunk.data() + name, input.semantic.data(), input.semantic.size()) != 0)
++            return false;
++        const auto type = u32(row + 16);
++        const std::string_view types[] = {"", "uint", "sint", "float"};
++        if (type == 0 || type >= std::size(types) || input.component_type != types[type] ||
++            input.semantic_index != u32(row + 8) || input.system_value != u32(row + 12) ||
++            input.register_index != u32(row + 20) || input.mask != chunk[row + 24] || input.rw_mask != chunk[row + 25])
++            return false;
++    }
++    return true;
++}
++
+ struct ShaderEntry {
+     std::string name;
+     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
+@@ -879,8 +910,20 @@ public:
+         return all.empty() ? nullptr : all.front();
+     }
+ 
+-    std::vector<const ShaderEntry*> candidates(std::string_view stage, std::string_view fssm_sha256) const {
+-        return lookup(entries_, stage, fssm_sha256);
++    // For a vertex program shared by several containers, use the signature from the PSO's bytecode when
++    // the index records a match. Keep the order among matching entries for the normal binding preference.
++    std::vector<const ShaderEntry*> candidates(std::string_view stage, std::string_view fssm_sha256,
++                                               std::span<const std::uint8_t> bytecode = {}) const {
++        auto all = lookup(entries_, stage, fssm_sha256);
++        if (stage != "vs" || all.size() < 2 || bytecode.empty()) return all;
++        const auto signature = dxbc_part(bytecode, "ISG1");
++        if (signature.empty()) return all;
++        std::vector<const ShaderEntry*> matches;
++        for (const auto* entry : all)
++            if (matches_isg1(entry->input_signature, signature)) matches.push_back(entry);
++        // An index without a complete matching signature still goes through the layout-based selection.
++        if (matches.empty()) return all;
++        return matches;
+     }
+ 
+     // The entries of an FSPX program, by the SHA-256 of its kind-6 bytes (fspx_code_sha256).
+@@ -1011,6 +1054,10 @@ private:
+                     element.semantic_index = u32(item.find("semantic_index"));
+                     element.register_index = u32(item.find("register"));
+                     element.system_value = u32(item.find("system_value"));
++                    if (auto* field = item.find("mask"); field && field->kind == Json::Kind::number)
++                        element.mask = u32(field);
++                    if (auto* field = item.find("rw_mask"); field && field->kind == Json::Kind::number)
++                        element.rw_mask = u32(field);
+                     if (const Json* v = item.find("component_type"); v && v->kind == Json::Kind::string)
+                         element.component_type = v->string;
+                     e.input_signature.push_back(std::move(element));
+diff --git a/runtime/test/shader_library_test.cpp b/runtime/test/shader_library_test.cpp
+index 321326fabb2d837d546a9aea9a4f7d09713d3c2d..d5e4ec4be3269dbb6db33466b5bf568f982ec6e8 100644
+--- a/runtime/test/shader_library_test.cpp
++++ b/runtime/test/shader_library_test.cpp
+@@ -669,6 +669,59 @@ int main() {
+     CHECK(library.candidates("vs", tagged_hash).empty());
+     CHECK(vs_all[1]->input_signature.size() == 1 && vs_all[1]->input_signature[0].semantic_index == 3 &&
+           vs_all[1]->input_signature[0].register_index == 0);
++    // A single COLOR0 layout fits all of these VS entries. Only the source container identifies the register
++    // and component mask used for translation. The two matching entries retain their original index order.
++    {
++        const auto subdir = dir / "vs_aliases";
++        std::filesystem::create_directory(subdir);
++        std::ofstream index(subdir / "index.json");
++        index << "{";
++        auto add = [&](const char* name, int reg, int mask, bool last = false) {
++            index << "\"" << name << "\":{\"stage\":\"vs\",\"fssm_sha256\":\"" << hash
++                  << "\",\"input_signature\":[{\"semantic\":\"COLOR\",\"semantic_index\":0,\"system_value\":0,"
++                     "\"component_type\":\"float\",\"register\":" << reg << ",\"mask\":" << mask
++                  << ",\"rw_mask\":1}]}" << (last ? "}" : ",");
++        };
++        add("other_register", 0, 3);
++        add("other_mask", 1, 15);
++        add("matching_a", 1, 3);
++        add("matching_b", 1, 3, true);
++        index.close();
++        ShaderLibrary aliases;
++        CHECK(aliases.load(subdir));
++
++        const auto dxil = dxbc_part(shader, "DXIL");
++        std::vector<std::uint8_t> wrapped = {'D','X','B','C'};
++        wrapped.resize(24, 0);
++        constexpr std::uint32_t isg_size = 8 + 32 + 6;  // header, row, "COLOR" with terminator
++        put32(wrapped, 40 + 8 + isg_size + 8 + std::uint32_t(dxil.size()));
++        put32(wrapped, 2);
++        put32(wrapped, 40);
++        put32(wrapped, 40 + 8 + isg_size);
++        wrapped.insert(wrapped.end(), {'I','S','G','1'});
++        put32(wrapped, isg_size);
++        put32(wrapped, 1);  // one row, starting eight bytes into ISG1
++        put32(wrapped, 8);
++        const auto row = wrapped.size();
++        // stream, name offset, semantic index, system value, float type, register, packed masks, precision
++        for (std::uint32_t word : {0u, 40u, 0u, 0u, 3u, 1u, 0x0103u, 0u}) put32(wrapped, word);
++        wrapped.insert(wrapped.end(), {'C','O','L','O','R',0,'D','X','I','L'});
++        put32(wrapped, std::uint32_t(dxil.size()));
++        wrapped.insert(wrapped.end(), dxil.begin(), dxil.end());
++        const auto program_hash = sha256_hex(fssm_program(wrapped));
++        CHECK(program_hash == hash);
++        const auto exact = aliases.candidates("vs", program_hash, wrapped);
++        CHECK(exact.size() == 2 && exact[0]->name == "matching_a" && exact[1]->name == "matching_b");
++        const auto fallback = aliases.candidates("vs", hash);
++        CHECK(fallback.size() == 4 && fallback[0]->name == "other_register");
++        CHECK(aliases.candidates("vs", hash, shader) == fallback);  // DXIL without ISG1
++        CHECK(aliases.candidates("vs", hash, fssm) == fallback);    // bare program
++        wrapped[row + 24] = 2;  // well-formed, unrecognized mask
++        CHECK(aliases.candidates("vs", hash, wrapped) == fallback);
++        wrapped[row + 24] = 3;
++        wrapped[row + 4] = 250;  // name outside the chunk
++        CHECK(aliases.candidates("vs", hash, wrapped) == fallback);
++    }
+     const ShaderEntry* ps = library.find("ps", hash);
+     CHECK(ps && ps->outputs.size() == 2 && ps->outputs[1] == 2);
+     CHECK(ps->inputs.size() == 4 && ps->inputs[0] == 0 && ps->inputs[3] == 29);

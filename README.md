@@ -65,6 +65,16 @@ Previously, the shaders stage could report success after a user reran it with a 
 
 The regression uses two synthetic pixel shaders, the actual translator, SPIRV-Tools and two shard workers. After truncating the merged index, the patched shaders stage restored the exact original bytes. Both compiled modules and both shard indexes retained their contents and modification times. Run `python -I tests/test_make_game_empty_translation.py ShadersStageTest.test_real_shards_restore_the_index_without_rebuilding_modules` with SPIRV-Tools on PATH to repeat it.
 
+## Vertex shader selection for programs with shared hashes
+
+Apply [vertex-input-signature.mbox](vertex-input-signature.mbox) with `git am /path/to/vertex-input-signature.mbox`. A clean replay on `de4c37383cad386eaa851047628d7b92c51009c5` produced tree `04098226eb9b51da255e5c0a197b9bd281fbad84`. The runtime reads the existing translator index.
+
+Two vertex shader containers can hold the same native program and declare the same semantic names while assigning POSITION and COLOR to different registers. Both translations pass the input-layout check. The patch compares the container’s ISG1 input signature against the indexed candidates before applying the existing layout and binding preferences.
+
+A synthetic 64 × 64 Vulkan draw on an RTX 4070 Ti used the same mesh, pipeline shaders and render target for both runs. With the original lookup all 4,096 pixels retained the clear value. With the matching signature all 4,096 pixels were green as expected. The Windows shader-library regression also passed under Wine. The GPU measurement covered native Vulkan vertex fetch. The full Windows graphics pipeline and retail startup remain unverified for this change.
+
+The [reproduction script](tests/vertex-input-signature/render.py) generates both containers, obtains their metadata from the translator and exercises the two lookups. With a patched source checkout, a built `vk_harness`, Python, a C++20 compiler and `glslangValidator` on Linux, run `python -I tests/vertex-input-signature/render.py /path/to/source /path/to/vk_harness` from this patch collection.
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
