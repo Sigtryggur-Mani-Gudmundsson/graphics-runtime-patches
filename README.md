@@ -75,6 +75,21 @@ A synthetic 64 × 64 Vulkan draw on an RTX 4070 Ti used the same mesh, pipeline 
 
 The [reproduction script](tests/vertex-input-signature/render.py) generates both containers, obtains their metadata from the translator and exercises the two lookups. With a patched source checkout, a built `vk_harness`, Python, a C++20 compiler and `glslangValidator` on Linux, run `python -I tests/vertex-input-signature/render.py /path/to/source /path/to/vk_harness` from this patch collection.
 
+## Pixel shaders with the same program and different position inputs
+
+Apply [pixel-input-signature.mbox](pixel-input-signature.mbox) after the vertex-input-signature patch. Applying both to `de4c37383cad386eaa851047628d7b92c51009c5` produced tree `226c3b802540d749f6f553f9655d6391f609a6f8`.
+
+The source pixel shader in this test exports v2 to red. The container’s `SV_Position` read mask determines whether v2 holds depth or reciprocal W. The test assembles one RDNA2 program and packages it in two synthetic containers. Leonida’s unpacker, disassembler and translator produce two validated SPIR-V modules with the same FSSM hash. The runtime now uses the input signature to choose between them. The translator also records a valid empty signature explicitly so the runtime can distinguish it from missing metadata.
+
+| Requested input | First entry in index | Original lookup | Patched lookup |
+| --- | --- | --- | --- |
+| Reciprocal W = 1 | Depth | 4,096 black pixels | 4,096 red pixels |
+| Depth = 0 | Reciprocal W | 4,096 red pixels | 4,096 black pixels |
+
+Both rows used the same full-screen triangle on an RTX 4070 Ti. A Windows build of the shader-library regression passed under Wine. The GPU readback came from the native Vulkan harness. A retail run with these aliases remains unverified.
+
+With LLVM’s AMDGPU assembler, SPIRV-Tools, glslangValidator, a C++20 compiler and Python on Linux, run `python -I tests/pixel-input-signature/render.py /path/to/patched/source /path/to/vk_harness`. [Reproduction script](tests/pixel-input-signature/render.py)
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
