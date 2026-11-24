@@ -1,0 +1,50 @@
+From 86fb86ce9e0b6571538b4b18ab373ecfbce7ef6f Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 16:57:22 +0000
+Subject: [PATCH] Preserve Vulkan initialization failures in both Windows
+ presenter tests
+
+---
+ runtime/test/vk_presenter_sync_test.cpp | 4 +++-
+ runtime/test/xbox_present_test.cpp      | 4 +++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/test/vk_presenter_sync_test.cpp b/runtime/test/vk_presenter_sync_test.cpp
+index a54bf666..14c17c5c 100644
+--- a/runtime/test/vk_presenter_sync_test.cpp
++++ b/runtime/test/vk_presenter_sync_test.cpp
+@@ -188,10 +188,12 @@ int main() {
+     using namespace leonida;
+ 
+     vktest::Device d;
+-    if (!d.create(true)) {
++    const auto device_status = d.initialize(true);
++    if (device_status == vktest::DeviceStatus::unavailable) {
+         std::fprintf(stderr, "vk_presenter_sync_test: no Vulkan device with presentation, skipped\n");
+         return 77;
+     }
++    EXPECT(device_status == vktest::DeviceStatus::ready);
+ 
+     WNDCLASSW wc{};
+     wc.lpfnWndProc = window_proc;
+diff --git a/runtime/test/xbox_present_test.cpp b/runtime/test/xbox_present_test.cpp
+index ce0ff853..c8bb5062 100644
+--- a/runtime/test/xbox_present_test.cpp
++++ b/runtime/test/xbox_present_test.cpp
+@@ -300,10 +300,12 @@ int main() {
+         EXPECT(!vktest::known_srgb_swapchain_storage_error(&data));
+     }
+     vktest::Device d;
+-    if (!d.create(true)) {  // no Vulkan loader, device or presentation extensions: nothing to test (ctest: skipped)
++    const auto device_status = d.initialize(true);
++    if (device_status == vktest::DeviceStatus::unavailable) {
+         std::printf("no Vulkan device with presentation: skipped\n");
+         return 77;
+     }
++    EXPECT(device_status == vktest::DeviceStatus::ready);
+ 
+     WNDCLASSW window_class{};
+     window_class.lpfnWndProc = window_proc;
+-- 
+2.56.1
+
