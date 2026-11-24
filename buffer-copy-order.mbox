@@ -1,0 +1,196 @@
+From ce19a1beb17bf9bd2161f4e1271407e510b232ba Mon Sep 17 00:00:00 2001
+From: natterman12 <92529018+natterman12@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:50:34 -0500
+Subject: [PATCH 1/2] vulkan_replay: order back-to-back buffer copies, as image
+ copies already are
+
+D3D12 runs consecutive copies on a buffer that stays in COPY_DEST or
+COPY_SOURCE in order, with no barrier from the application, in one list or
+across lists on a queue. Vulkan orders nothing without a barrier. The
+replay emitted that barrier for image copies (copy_layout) but not for a
+plain buffer-to-buffer copy, so two copies into the same buffer raced as
+far as Vulkan is concerned: synchronization validation reports
+WRITE_AFTER_WRITE on vk_queue's backlog case, ten times on an RTX 3080 Ti.
+
+A plain buffer copy now gets a memory barrier from earlier transfer writes
+to its transfer reads and writes.
+
+replay_copy_offset checks the barrier ahead of one copy and ahead of each
+of two back-to-back copies into the same buffer. replay_query_edges' fake
+Vulkan table gains the barrier entry point the replay now calls.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+(cherry picked from commit b89bab16c1410834e2d1a9b264d1374d6fbde38e)
+---
+ runtime/src/vulkan_replay.h              |  7 +++++
+ runtime/test/replay_copy_offset_test.cpp | 39 +++++++++++++++++++++---
+ runtime/test/replay_query_edges_test.cpp |  5 +++
+ 3 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index e179c67c..9206102c 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -3781,6 +3781,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
+                 begin_statistics();
+             } else if (!p.buffer_copies.empty()) {
++                // D3D12 orders back-to-back copies on buffers that stay in COPY_DEST or COPY_SOURCE with no barrier
++                // from the application, in one list or across lists on a queue; Vulkan does not. As copy_layout does
++                // for images, an earlier transfer write is ordered before this copy's reads and writes
++                // (write-after-write and read-after-write, which synchronization validation reports otherwise).
++                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
+                                p.buffer_copies.data());
+             } else if (p.staged) {
+diff --git a/runtime/test/replay_copy_offset_test.cpp b/runtime/test/replay_copy_offset_test.cpp
+index 7392344f..23d80cd8 100644
+--- a/runtime/test/replay_copy_offset_test.cpp
++++ b/runtime/test/replay_copy_offset_test.cpp
+@@ -15,13 +15,27 @@ std::vector<VkBufferImageCopy> b2i_copies;
+ std::vector<VkBufferImageCopy> i2b_copies;
+ std::vector<leonida::Depth24Job> depth24_jobs;
+ 
+-VKAPI_ATTR void VKAPI_CALL noop_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+-                                        std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
+-                                        const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
++// Whether a barrier since the last buffer copy ordered earlier transfer writes before transfer reads and writes, and
++// that answer for each vkCmdCopyBuffer in turn: D3D12 orders back-to-back copies, Vulkan needs the barrier.
++bool transfer_writes_ordered = false;
++std::vector<bool> buffer_copy_ordered;
++
++VKAPI_ATTR void VKAPI_CALL rec_barrier(VkCommandBuffer, VkPipelineStageFlags src_stages, VkPipelineStageFlags dst_stages,
++                                       VkDependencyFlags, std::uint32_t memory_count, const VkMemoryBarrier* memory,
++                                       std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t,
++                                       const VkImageMemoryBarrier*) {
++    const VkAccessFlags after = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++    for (std::uint32_t i = 0; i < memory_count; ++i)
++        if ((src_stages & VK_PIPELINE_STAGE_TRANSFER_BIT) && (dst_stages & VK_PIPELINE_STAGE_TRANSFER_BIT) &&
++            (memory[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) && (memory[i].dstAccessMask & after) == after)
++            transfer_writes_ordered = true;
++}
+ 
+ VKAPI_ATTR void VKAPI_CALL rec_copy_buffer(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t count,
+                                            const VkBufferCopy* regions) {
+     for (std::uint32_t i = 0; i < count; ++i) buffer_copies.push_back(regions[i]);
++    buffer_copy_ordered.push_back(transfer_writes_ordered);
++    transfer_writes_ordered = false;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL rec_copy_b2i(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, std::uint32_t count,
+@@ -56,7 +70,7 @@ int main() {
+     using namespace leonida;
+ 
+     ReplayFunctions vk{};
+-    vk.pipeline_barrier = noop_barrier;
++    vk.pipeline_barrier = rec_barrier;
+     vk.copy_buffer = rec_copy_buffer;
+     vk.copy_buffer_to_image = rec_copy_b2i;
+     vk.copy_image_to_buffer = rec_copy_i2b;
+@@ -135,6 +149,8 @@ int main() {
+ 
+     const auto run = [&](const CommandList& list) {
+         buffer_copies.clear();
++        buffer_copy_ordered.clear();
++        transfer_writes_ordered = false;
+         b2i_copies.clear();
+         i2b_copies.clear();
+         depth24_jobs.clear();
+@@ -149,6 +165,21 @@ int main() {
+         expect(buffer_copies.size() == 1 && buffer_copies[0].srcOffset == src_buf.buffer_offset &&
+                    buffer_copies[0].dstOffset == dst_buf.buffer_offset && buffer_copies[0].size == src_buf.size,
+                "CopyResource applies src and dst buffer_offset");
++        expect(buffer_copy_ordered == std::vector<bool>{true},
++               "a buffer copy is ordered after earlier transfer writes (an earlier list on the queue may have written)");
++    }
++
++    // 1b. Back-to-back copies into the same buffer, with no barrier from the application: D3D12 runs them in order,
++    // so each vkCmdCopyBuffer needs its own barrier after the transfer write before it (one barrier ahead of the
++    // first copy would leave the second unordered against the first).
++    {
++        CommandList list;
++        expect(list.copy_buffer({2, 0, 1, 0, 256}) && list.copy_buffer({2, 128, 1, 512, 256}) && list.close(),
++               "record two overlapping CopyBufferRegion calls");
++        expect(run(list) == ReplayResult::success, "back-to-back buffer copies replay");
++        expect(buffer_copies.size() == 2, "both buffer copies are emitted");
++        expect(buffer_copy_ordered == (std::vector<bool>{true, true}),
++               "each back-to-back buffer copy is ordered after the transfer write before it");
+     }
+ 
+     // 2. CopyResource within a single shared backing VkBuffer (arena): disjoint & adjacent succeed, overlap fails.
+diff --git a/runtime/test/replay_query_edges_test.cpp b/runtime/test/replay_query_edges_test.cpp
+index 820dc0dc..11cce577 100644
+--- a/runtime/test/replay_query_edges_test.cpp
++++ b/runtime/test/replay_query_edges_test.cpp
+@@ -168,6 +168,11 @@ struct MockReplay {
+             expect(!current->conditional, "resolve fill inside predicate");
+             current->fill(b, off, n, value);
+         };
++        // A plain buffer copy is ordered after earlier transfer writes with a barrier, as image copies are; this
++        // fake only has to accept the call.
++        v.pipeline_barrier = +[](VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
++                                 unsigned, const VkMemoryBarrier*, unsigned, const VkBufferMemoryBarrier*, unsigned,
++                                 const VkImageMemoryBarrier*) {};
+         v.copy_buffer = +[](VkCommandBuffer, VkBuffer a, VkBuffer b, unsigned n, const VkBufferCopy* copies) {
+             ++current->native_copies;
+             for (unsigned i = 0; i < n; ++i) {
+-- 
+2.56.1
+
+
+From 634f5ecbcfb31d5da310b8c75e14d63ccce12dcc Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 04:00:23 +0000
+Subject: [PATCH 2/2] replay: check the buffer copy barrier during preparation
+
+---
+ runtime/src/vulkan_replay.h              | 1 +
+ runtime/test/predicated_copy_test.cpp    | 1 +
+ runtime/test/replay_copy_offset_test.cpp | 5 +++++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index 9206102c..a3486eb0 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -2932,6 +2932,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
+                 p.image_copies.clear();
+             }
+             if (result != ReplayResult::success) return result;
++            if (!p.buffer_copies.empty() && !vk.pipeline_barrier) return ReplayResult::unsupported;
+             if (p.binding.host_readable) {
+                 out.wrote_readback = true;
+                 const bool compute_write =
+diff --git a/runtime/test/predicated_copy_test.cpp b/runtime/test/predicated_copy_test.cpp
+index 3eaf0b16..b3069520 100644
+--- a/runtime/test/predicated_copy_test.cpp
++++ b/runtime/test/predicated_copy_test.cpp
+@@ -8,6 +8,7 @@ template<class T>T handle(std::uintptr_t n){return reinterpret_cast<T>(n);}
+ int main(){
+     using namespace leonida;
+     ReplayFunctions vk{};
++    vk.pipeline_barrier = available<PFN_vkCmdPipelineBarrier>();
+     vk.copy_buffer=available<PFN_vkCmdCopyBuffer>();vk.copy_buffer_to_image=available<PFN_vkCmdCopyBufferToImage>();
+     vk.copy_image_to_buffer=available<PFN_vkCmdCopyImageToBuffer>();vk.copy_image=available<PFN_vkCmdCopyImage>();
+     vk.begin_conditional_rendering=available<PFN_vkCmdBeginConditionalRenderingEXT>();
+diff --git a/runtime/test/replay_copy_offset_test.cpp b/runtime/test/replay_copy_offset_test.cpp
+index 23d80cd8..a87aaf0d 100644
+--- a/runtime/test/replay_copy_offset_test.cpp
++++ b/runtime/test/replay_copy_offset_test.cpp
+@@ -167,6 +167,11 @@ int main() {
+                "CopyResource applies src and dst buffer_offset");
+         expect(buffer_copy_ordered == std::vector<bool>{true},
+                "a buffer copy is ordered after earlier transfer writes (an earlier list on the queue may have written)");
++        auto missing_barrier = vk;
++        missing_barrier.pipeline_barrier = nullptr;
++        PreparedList prepared;
++        expect(prepare(list, resolve, missing_barrier, prepared) == ReplayResult::unsupported,
++               "plain buffer copy requires its ordering barrier during preparation");
+     }
+ 
+     // 1b. Back-to-back copies into the same buffer, with no barrier from the application: D3D12 runs them in order,
+-- 
+2.56.1
+

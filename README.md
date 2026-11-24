@@ -121,6 +121,10 @@ The original PR refused all six synthetic programs from real LLVM 19 listings. T
 
 On an RTX 4070 Ti, the previously rejected LLVM 19 pixel shader matched the reference in all 4,096 pixels. LLVM 23 and the Python decoder produced the same pixels. Both versions of LLVM also passed the decoder parity suite after correcting the lane-selector spelling and null export operand. [GPU fixture, expected values and commands](tests/sdwa-inline/README.md)
 
+## Buffer writes on a dedicated copy queue
+
+Apply [copy-queue-sync.mbox](copy-queue-sync.mbox) and [buffer-copy-order.mbox](buffer-copy-order.mbox) to the base commit. The two series preserve the contributions in PRs 314 and 354 and add checks for the copy queue's stage filter and an unavailable barrier callback. The dedicated transfer queue on an RTX 4070 Ti reproduced four synchronization hazards before the corrections. [Test results, attribution and reproduction commands](tests/copy-queue-sync/README.md)
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.

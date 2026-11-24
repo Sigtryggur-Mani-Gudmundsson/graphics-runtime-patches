@@ -1,0 +1,397 @@
+From e416baf1557cd68201801b27d32eeb47e61ebf14 Mon Sep 17 00:00:00 2001
+From: kykifox1337-source <kykifox1337@gmail.com>
+Date: Mon, 23 Nov 2026 13:10:57 -0500
+Subject: [PATCH 1/2] d3d12: SYNC_COPY waits for the CLEAR stage too (D3D-838)
+
+An enhanced barrier's D3D12_BARRIER_SYNC_COPY mapped to VK_PIPELINE_STAGE_2_COPY_BIT only. Two D3D12
+copy-scope commands are not Vulkan copies: WriteBufferImmediate is recorded as vkCmdUpdateBuffer and
+ResolveQueryData's never-written queries as vkCmdFillBuffer, and synchronization2 runs both in the CLEAR
+stage. A SYNC_COPY barrier after either therefore did not order it, and a copy after the barrier could read
+the word before the write landed.
+
+vulkan_sync now maps SYNC_COPY to COPY | CLEAR. vk_command_replay_test part K records WriteBufferImmediate,
+a SYNC_COPY -> SYNC_COPY buffer barrier and a CopyBufferRegion of the written word; under
+LEONIDA_VK_VALIDATION=1 it is a read-after-write hazard without this change. d3d12_state_map_test and
+docs/d3d12_vulkan.md follow the new mapping.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit bbc8999d509422782f39e106a77205b1d4f4dda4)
+---
+ docs/d3d12_vulkan.md                    |  6 +-
+ runtime/src/vulkan_replay.h             |  5 +-
+ runtime/test/d3d12_state_map_test.cpp   |  8 ++-
+ runtime/test/vk_command_replay_test.cpp | 77 ++++++++++++++++++++++++-
+ 4 files changed, 91 insertions(+), 5 deletions(-)
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index dcd778a..0ff8710 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2676,7 +2676,11 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
+ - Enhanced barriers (`D3D12_BARRIER_SYNC_*`, `D3D12_BARRIER_ACCESS_*`, `D3D12_BARRIER_LAYOUT_*`) map directly to
+   `VkPipelineStageFlags2`, `VkAccessFlags2` and `VkImageLayout` (`vulkan_sync`, `vulkan_barrier_access`,
+   `vulkan_layout`). Queue-specific layouts map like their generic forms; ray tracing, video and split scopes use
+-  `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`.
++  `ALL_COMMANDS`; `LayoutBefore = UNDEFINED` or the discard flag becomes `oldLayout = UNDEFINED`. `SYNC_COPY` is
++  `COPY | CLEAR`, not `COPY` alone: `WriteBufferImmediate` is recorded as `vkCmdUpdateBuffer` and
++  `ResolveQueryData`'s never-written queries as `vkCmdFillBuffer`, which synchronization2 runs in the `CLEAR` stage
++  (D3D-838; `vk_command_replay_test` part K is a read-after-write hazard under synchronization validation without
++  it).
+ - `DiscardResource` (D3D-26): each discarded image subresource gets a barrier from `oldLayout = UNDEFINED` to the
+   layout the tracker already has for it, so the driver may drop the contents while later commands see no layout
+   change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index 78b597a..0ba76a2 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -217,7 +217,10 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
+          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
+         {y::render_target, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+         {y::compute_shading, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+-        {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT},
++        // CLEAR as well: two D3D12 copy-scope commands are recorded as Vulkan clear commands, WriteBufferImmediate
++        // as vkCmdUpdateBuffer and ResolveQueryData's never-written queries as vkCmdFillBuffer, and synchronization2
++        // puts both in the CLEAR stage, not COPY.
++        {y::copy, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT},
+         {y::resolve, VK_PIPELINE_STAGE_2_RESOLVE_BIT},
+         {y::execute_indirect, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT},
+         {y::all_shading, pre_raster | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
+diff --git a/runtime/test/d3d12_state_map_test.cpp b/runtime/test/d3d12_state_map_test.cpp
+index 9db6ad0..2fec30b 100644
+--- a/runtime/test/d3d12_state_map_test.cpp
++++ b/runtime/test/d3d12_state_map_test.cpp
+@@ -404,7 +404,10 @@ int main() {
+     CHECK(vulkan_sync(y::split) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+     CHECK(vulkan_sync(y::render_target) == VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+     CHECK(vulkan_sync(y::copy | y::pixel_shading) ==
+-          (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
++          (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT));
++    // SYNC_COPY covers WriteBufferImmediate (vkCmdUpdateBuffer) and ResolveQueryData's zero fill (vkCmdFillBuffer),
++    // which synchronization2 runs in the CLEAR stage, not COPY (D3D-838).
++    CHECK(vulkan_sync(y::copy) == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT));
+     CHECK(vulkan_sync(y::raytracing) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+     CHECK(vulkan_barrier_access(a::no_access) == VK_ACCESS_2_NONE);
+     const auto cb_scope = vulkan_barrier_scope(y::pixel_shading, a::constant_buffer);
+@@ -427,7 +430,8 @@ int main() {
+         widened = scope(y::clear_unordered_access_view, a::copy_source);  // CLEAR only writes
+         CHECK(widened.stages & VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT);
+         widened = scope(y::copy, a::unordered_access);
+-        CHECK(widened.stages == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
++        CHECK(widened.stages == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT |
++                                 VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+                                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT));
+         // Pairs Vulkan already accepts are left exactly as vulkan_sync / vulkan_barrier_access map them.
+         const std::pair<std::uint32_t, std::uint32_t> unchanged[] = {
+diff --git a/runtime/test/vk_command_replay_test.cpp b/runtime/test/vk_command_replay_test.cpp
+index 9769e70..c31c23b 100644
+--- a/runtime/test/vk_command_replay_test.cpp
++++ b/runtime/test/vk_command_replay_test.cpp
+@@ -1265,6 +1265,81 @@ int part_j(vktest::Device& d) {
+     return 0;
+ }
+ 
++// Part K (D3D-838): an enhanced barrier with SYNC_COPY orders a WriteBufferImmediate before it. The write is recorded
++// as vkCmdUpdateBuffer, which synchronization2 runs in the CLEAR stage, not COPY, and a DEFAULT-mode write gets no
++// barrier of its own (replay leaves it to the application's). So: the write puts a word in src, a SYNC_COPY ->
++// SYNC_COPY buffer barrier (COPY_DEST -> COPY_SOURCE) follows, and CopyBufferRegion copies the word to dst. Under
++// LEONIDA_VK_VALIDATION=1 synchronization validation reports the read-after-write hazard when the barrier's source
++// stages leave CLEAR out; in every run the copied word is checked.
++int part_k(vktest::Device& d) {
++    constexpr VkDeviceSize bytes = 256;
++    constexpr std::uint64_t va_src = 0x50000;
++    constexpr std::uint32_t value = 0x5eed1234;
++    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++    void *src_mapped = nullptr, *dst_mapped = nullptr;
++    const VkBuffer src = d.buffer(bytes, usage, &src_mapped);
++    const VkBuffer dst = d.buffer(bytes, usage, &dst_mapped);
++    EXPECT(src && dst && src_mapped && dst_mapped);
++    std::memset(src_mapped, 0, bytes);
++    std::memset(dst_mapped, 0, bytes);
++
++    constexpr ResourceId src_id = 50, dst_id = 51;
++    ResourceBinding src_binding{}, dst_binding{};
++    src_binding.buffer = src;
++    src_binding.size = bytes;
++    src_binding.va = va_src;
++    dst_binding.buffer = dst;
++    dst_binding.size = bytes;
++    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
++        if (id == src_id) return &src_binding;
++        if (id == dst_id) return &dst_binding;
++        return nullptr;
++    };
++    ReplayFunctions vk{};
++    vk.pipeline_barrier = d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
++    vk.pipeline_barrier2 = d.fn<PFN_vkCmdPipelineBarrier2>("vkCmdPipelineBarrier2");
++    vk.copy_buffer = d.fn<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");  // replay wants all four copy functions
++    vk.copy_buffer_to_image = d.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
++    vk.copy_image_to_buffer = d.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
++    vk.copy_image = d.fn<PFN_vkCmdCopyImage>("vkCmdCopyImage");
++    vk.update_buffer = d.fn<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
++    vk.buffer_at = [&](std::uint64_t va, std::uint64_t length, VkBuffer& buffer, VkDeviceSize& offset) {
++        if (va < va_src || va - va_src >= bytes || length > bytes - (va - va_src)) return false;
++        buffer = src;
++        offset = va - va_src;
++        return true;
++    };
++
++    namespace ac = d3d12_access;
++    namespace y = d3d12_sync;
++    CommandList list;
++    EXPECT(list.write_immediate({va_src + 8, value, write_immediate_mode::normal}));
++    EXPECT(list.barrier(BufferBarrier{y::copy, y::copy, ac::copy_dest, ac::copy_source, src_id}));
++    EXPECT(list.copy_buffer({dst_id, 16, src_id, 8, 4}));
++    EXPECT(list.close());
++
++    const unsigned errors_before = d.validation_errors();
++    ReplayResult result = ReplayResult::success;
++    EXPECT(d.run([&](VkCommandBuffer cb) {
++        result = replay(list, cb, resolve, vk);
++        if (result != ReplayResult::success) std::fprintf(stderr, "K: replay returned %d\n", int(result));
++        return result == ReplayResult::success;
++    }));
++    const unsigned errors = d.validation_errors() - errors_before;
++    std::uint32_t copied = 0;
++    std::memcpy(&copied, static_cast<const std::uint8_t*>(dst_mapped) + 16, 4);
++    if (copied != value) {
++        std::fprintf(stderr, "K: copied 0x%08x, want 0x%08x\n", copied, value);
++        ++g_mismatches;
++    }
++    if (errors) {
++        std::fprintf(stderr, "K: %u validation errors: a SYNC_COPY barrier does not cover vkCmdUpdateBuffer\n", errors);
++        return 1;
++    }
++    std::printf("K: SYNC_COPY orders WriteBufferImmediate (vkCmdUpdateBuffer, CLEAR stage) before a copy\n");
++    return 0;
++}
++
+ } // namespace
+ 
+ int main() {
+@@ -1276,7 +1351,7 @@ int main() {
+     }
+     EXPECT(status == vktest::DeviceStatus::ready);
+     if (part_a(device) || part_b(device) || part_c(device) || part_d(device) || part_e(device) || part_f(device) ||
+-        part_g(device) || part_h(device) || part_i(device) || part_j(device))
++        part_g(device) || part_h(device) || part_i(device) || part_j(device) || part_k(device))
+         return 1;
+     if (g_mismatches) return 1;
+     if (device.validation_errors()) {
+-- 
+2.56.1
+
+
+From dc35c1f1a7d9bf89cc7b176d8eac4df2aec0e118 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 03:58:29 +0000
+Subject: [PATCH 2/2] d3d12: preserve CLEAR dependencies on copy queues
+
+---
+ docs/d3d12_vulkan.md                    |  3 +-
+ runtime/src/vulkan_replay.h             | 16 ++++++---
+ runtime/test/replay_clear_gate_test.cpp | 30 ++++++++++++++--
+ runtime/test/vk_queue_test.cpp          | 47 +++++++++++++++++++++++--
+ 4 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index 0ff8710..fcf309d 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2680,7 +2680,8 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
+   `COPY | CLEAR`, not `COPY` alone: `WriteBufferImmediate` is recorded as `vkCmdUpdateBuffer` and
+   `ResolveQueryData`'s never-written queries as `vkCmdFillBuffer`, which synchronization2 runs in the `CLEAR` stage
+   (D3D-838; `vk_command_replay_test` part K is a read-after-write hazard under synchronization validation without
+-  it).
++  it). The copy queue keeps both stages when filtering barriers. It initializes colour images by copying from a
++  zero buffer because transfer-only command pools support buffer updates and fills but cannot clear colour images.
+ - `DiscardResource` (D3D-26): each discarded image subresource gets a barrier from `oldLayout = UNDEFINED` to the
+   layout the tracker already has for it, so the driver may drop the contents while later commands see no layout
+   change. The other cases are no-ops, which "contents undefined" allows: buffers, discards with rectangles (only
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index 0ba76a2..e179c67 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -1317,10 +1317,10 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
+ 
+ inline constexpr VkPipelineStageFlags2 queue_stages_copy =
+     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
+-    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
++    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
++    VK_PIPELINE_STAGE_2_CLEAR_BIT;  // vkCmdFillBuffer and vkCmdUpdateBuffer also run on transfer queues.
+ inline constexpr VkPipelineStageFlags2 queue_stages_compute =
+-    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+-    VK_PIPELINE_STAGE_2_CLEAR_BIT;
++    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+ 
+ inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
+     if (!vk.queue_stages) return;
+@@ -1534,6 +1534,12 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
+     return true;
+ }
+ 
++// Colour image clears need graphics or compute. Depth/stencil clears need graphics.
++inline bool can_clear_image(const ReplayFunctions& vk, VkImageAspectFlags aspects) {
++    return !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) &&
++                                 (aspects & VK_IMAGE_ASPECT_COLOR_BIT));
++}
++
+ // Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
+ // so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
+ // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
+@@ -1545,7 +1551,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
+         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
+         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+-        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
++        const bool can_clear = can_clear_image(vk, piece.range.aspectMask);
+         const bool compressed = fmt.block > 1 || (!can_clear && color);
+         if (resource.not_zeroed || (!can_clear && !color)) {
+             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
+@@ -2579,7 +2585,7 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
+         pieces.clear();
+         if (!tracker.pieces(id, range, pieces)) return false;
+         for (const auto& piece : pieces)
+-            if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED &&
++            if (piece.layout == VK_IMAGE_LAYOUT_UNDEFINED && detail::can_clear_image(vk, piece.range.aspectMask) &&
+                 ((piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) ? !vk.clear_color_image
+                                                                       : !vk.clear_depth_stencil_image))
+                 return true;
+diff --git a/runtime/test/replay_clear_gate_test.cpp b/runtime/test/replay_clear_gate_test.cpp
+index c75f2bf..99e31d6 100644
+--- a/runtime/test/replay_clear_gate_test.cpp
++++ b/runtime/test/replay_clear_gate_test.cpp
+@@ -6,7 +6,9 @@
+ #include <cstdio>
+ 
+ namespace {
+-unsigned clears = 0, attachment_clears = 0;
++unsigned clears = 0, attachment_clears = 0, zero_copies = 0;
++VKAPI_ATTR void VKAPI_CALL copy_zero(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout,
++    std::uint32_t, const VkBufferImageCopy*) { ++zero_copies; }
+ VKAPI_ATTR void VKAPI_CALL barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+     std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
+     std::uint32_t, const VkImageMemoryBarrier*) {}
+@@ -51,7 +53,7 @@ leonida::ReplayFunctions functions() {
+ 
+ leonida::ReplayResult run(const leonida::CommandList& list, const leonida::ResourceBinding& binding,
+                           const leonida::ReplayFunctions& vk, leonida::LayoutTracker* tracker = nullptr) {
+-    clears = attachment_clears = 0;
++    clears = attachment_clears = zero_copies = 0;
+     return leonida::replay(list, VK_NULL_HANDLE, [&](auto) { return &binding; }, vk, tracker);
+ }
+ } // namespace
+@@ -110,6 +112,30 @@ int main() {
+     expect(run(rect_color, not_zeroed, vk, &fresh) == ReplayResult::success && clears == 0,
+            "not_zeroed image: no zero-clear needed");
+ 
++    // Transfer-only command pools can update buffers but cannot record vkCmdClearColorImage.
++    leonida::CommandList transition;
++    expect(transition.transition({1, 0, leonida::d3d12_state::copy_dest, leonida::d3d12_state::copy_source}) &&
++               transition.close(), "record a copy-list transition");
++    vk = functions();
++    vk.queue_stages = leonida::detail::queue_stages_copy;
++    vk.zero_buffer = reinterpret_cast<VkBuffer>(std::uintptr_t{2});
++    vk.zero_size = 256;
++    vk.copy_buffer_to_image = copy_zero;
++    const auto initialize = [&] {
++        leonida::LayoutTracker uninitialized;
++        uninitialized.track(1, color, VK_IMAGE_LAYOUT_UNDEFINED);
++        return run(transition, color, vk, &uninitialized);
++    };
++    expect(initialize() == ReplayResult::success && zero_copies == 1, "copy queue uses the zero buffer");
++    vk.clear_color_image = clear_color;
++    expect(initialize() == ReplayResult::success && zero_copies == 1 && clears == 0,
++           "copy queue uses the zero buffer even with a device-wide image-clear function");
++    vk.queue_stages = leonida::detail::queue_stages_compute;
++    expect(initialize() == ReplayResult::success && zero_copies == 0 && clears == 1,
++           "compute queue clears the colour image");
++    vk.clear_color_image = nullptr;
++    expect(initialize() == ReplayResult::unsupported, "compute queue requires the colour-clear function");
++
+     if (failures) return 1;
+     std::printf("replay_clear_gate_test: whole-view and implicit zero-clears refused without their function\n");
+     return 0;
+diff --git a/runtime/test/vk_queue_test.cpp b/runtime/test/vk_queue_test.cpp
+index 744adfa..d17b0f6 100644
+--- a/runtime/test/vk_queue_test.cpp
++++ b/runtime/test/vk_queue_test.cpp
+@@ -8,6 +8,7 @@
+ #include "vk_test_device.h"
+ #include "../src/vulkan_backend.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <cstdint>
+@@ -217,17 +218,19 @@ int main() {
+     for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, 7);
+ 
+     const ResourceId upload_id = 1, mid_id = 2, readback_id = 3, tex_id = 4, tex_readback_id = 5, stale_src_id = 7;
+-    auto add_buffer = [&](ResourceId id, VkBuffer b, VkDeviceSize size) {
++    auto add_buffer = [&](ResourceId id, VkBuffer b, VkDeviceSize size, std::uint64_t va = 0) {
+         ResourceBinding r;
+         r.buffer = b;
+         r.size = size;
++        r.va = va;
+         context.add_resource(id, r);
+     };
+     add_buffer(upload_id, upload, kSize);
+     add_buffer(mid_id, mid, kSize);
+     add_buffer(readback_id, readback, kSize);
+     add_buffer(tex_readback_id, tex_readback, kTex * kTex * 4);
+-    add_buffer(stale_src_id, stale_src, kSize);
++    constexpr std::uint64_t src_va = 0x50000;
++    add_buffer(stale_src_id, stale_src, kSize, src_va);
+     ResourceBinding tex;
+     tex.image = texture;
+     tex.format = VK_FORMAT_R8G8B8A8_UNORM;
+@@ -240,6 +243,46 @@ int main() {
+     VulkanFence fence(context, 0);
+     EXPECT(fence.semaphore());
+ 
++    // Both writes run in CLEAR on the queue chosen for copies. Resolve an un-ended
++    // timestamp to exercise replay's zero-fill path without a GPU timestamp dependency.
++    {
++        constexpr QueryHeapId heap_id = 1;
++        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
++        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        info.queryCount = 1;
++        QueryPool heap{};
++        heap.heap_type = d3d12_query_heap::copy_queue_timestamp;
++        heap.count = 1;
++        heap.ended.assign(1, false);
++        EXPECT(d.fn<PFN_vkCreateQueryPool>("vkCreateQueryPool")(d.device, &info, nullptr, &heap.pool) == VK_SUCCESS);
++        context.add_query_pool(heap_id, heap);
++        std::memset(stale_src_map, 0x5a, 24);
++        std::memset(readback_map, 0xa5, 24);
++        constexpr std::uint32_t word = 0x5eed1234;
++        CommandList writes;
++        EXPECT(writes.copy_buffer({readback_id, 32, stale_src_id, 0, 24}));
++        EXPECT(writes.barrier(BufferBarrier{d3d12_sync::copy, d3d12_sync::copy, d3d12_access::copy_source,
++                                            d3d12_access::copy_dest, stale_src_id}));
++        EXPECT(writes.write_immediate({src_va + 4, word, write_immediate_mode::normal}));
++        EXPECT(writes.resolve_queries({heap_id, d3d12_query::timestamp, 0, 1, stale_src_id, 16}));
++        EXPECT(writes.barrier(BufferBarrier{d3d12_sync::copy, d3d12_sync::copy, d3d12_access::copy_dest,
++                                            d3d12_access::copy_source, stale_src_id}));
++        EXPECT(writes.copy_buffer({readback_id, 4, stale_src_id, 4, 4}));
++        EXPECT(writes.copy_buffer({readback_id, 16, stale_src_id, 16, 8}));
++        EXPECT(writes.close());
++        const CommandList* lists[] = {&writes};
++        EXPECT(copy.execute(lists) == ReplayResult::success && copy.idle());
++        context.remove_query_pool(heap_id);
++        d.fn<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(d.device, heap.pool, nullptr);
++        constexpr std::uint32_t guard = 0xa5a5a5a5;
++        const std::array<std::uint32_t, 6> expected{guard, word, guard, guard, 0, 0};
++        EXPECT(std::memcmp(readback_map, expected.data(), sizeof(expected)) == 0);
++        const auto* snapshot = static_cast<const std::uint8_t*>(readback_map) + 32;
++        EXPECT(std::all_of(snapshot, snapshot + 24, [](std::uint8_t byte) { return byte == 0x5a; }));
++        EXPECT(d.validation_errors() == 0);
++        std::printf("copy queue: immediate write and timestamp zero-fill ordered before readback\n");
++    }
++
+     // 1. Copy queue: buffer upload and a texture upload from the same staging buffer (footprint copy), then signal.
+     CommandList on_copy;
+     EXPECT(on_copy.copy_buffer({mid_id, 0, upload_id, 0, kSize}));
+-- 
+2.56.1
+
