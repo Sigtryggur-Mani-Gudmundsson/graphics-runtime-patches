@@ -1,0 +1,286 @@
+From 68862ee71b2cb62c67f5f1e0200aef4e0bb89e91 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 05:20:58 +0000
+Subject: [PATCH] d3d12: refresh title-backed sampler tables on command list
+ submission
+
+Record the declared sampler ranges and identify the submitting device's heap before pulling the CPU-written slots. Preserve S# bytes without attempting buffer VA resolution. Keep the buffer scanner's existing budget and cover the full shader-visible sampler heap.
+
+Extend the M2 fixture from AlxcBTW and Vonsek to swap and restore point samplers after Close. Exercise a one-slot table, an unbounded table, and the mirror-disabled control.
+---
+ runtime/CMakeLists.txt                  |  6 +++
+ runtime/shims/d3d12_com.h               |  4 +-
+ runtime/shims/d3d12_vulkan_device.cpp   | 62 ++++++++++++----------
+ runtime/test/d3d12_m2_textured_test.cpp | 68 +++++++++++++++++++++++--
+ 4 files changed, 107 insertions(+), 33 deletions(-)
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 9a483122..fa6a185e 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -2619,6 +2619,12 @@ if(TARGET Vulkan::Headers)
+                                  LEONIDA_TEST_M2_DIR="${LEONIDA_M2_DIR}")
+       target_compile_options(d3d12_m2_textured_test PRIVATE /W4 /permissive- /utf-8)
+       add_test(NAME d3d12_m2_textured COMMAND d3d12_m2_textured_test)
++      add_test(NAME d3d12_m2_sampler_refresh COMMAND d3d12_m2_textured_test --refresh-samplers)
++      add_test(NAME d3d12_m2_unbounded_sampler_refresh COMMAND d3d12_m2_textured_test --refresh-unbounded-samplers)
++      set_tests_properties(d3d12_m2_sampler_refresh d3d12_m2_unbounded_sampler_refresh PROPERTIES
++                           SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1")
++      add_test(NAME d3d12_m2_sampler_refresh_off COMMAND d3d12_m2_textured_test --refresh-samplers-off)
++      set_tests_properties(d3d12_m2_sampler_refresh_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=0")
+       set_tests_properties(d3d12_m2_textured PROPERTIES SKIP_RETURN_CODE 77)
+ 
+       # M2, formats: BC1 and BC7 textures with mip chains and an R8G8B8A8 2D array through the same descriptor path.
+diff --git a/runtime/shims/d3d12_com.h b/runtime/shims/d3d12_com.h
+index 2811ed1f..1dab935b 100644
+--- a/runtime/shims/d3d12_com.h
++++ b/runtime/shims/d3d12_com.h
+@@ -402,8 +402,8 @@ struct RootArgumentLayout {
+         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
+         std::uint32_t constant_count;  // constants only
+         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+-        // A table: the CBV/SRV/UAV slots its ranges declare (an unbounded range counts as 1024), for the scan of
+-        // title-written V#s before a submission (src/title_va_alias.h). 0: a sampler table, or not a table.
++        // Declared span for submission-time heap refresh. Views are capped at 1024 slots and samplers at the
++        // shader-visible sampler heap limit. Zero for a parameter without a table.
+         std::uint32_t table_descriptors = 0;
+     };
+     std::vector<Parameter> parameters;
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 165440b1..3bc9542c 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -111,20 +111,22 @@ std::uint64_t vsharp_address(std::uint64_t va, std::uint64_t bytes,
+     return to;
+ }
+ 
+-// The CBV/SRV/UAV slots a descriptor table declares: the end of its furthest range (D3D12 appends a range at
+-// D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND), an unbounded range counted as 1024. 0 for a sampler table or no table.
+-std::uint32_t table_view_descriptors(const rt::rootsig::RootParameter& param) {
+-    if (param.type != rt::rootsig::ParamType::Table) return 0;
+-    constexpr std::uint32_t kUnbounded = 1024;
++// The furthest range end is the span to refresh at submission. Sampler ranges use their full hardware
++// heap limit. Buffer-view translation retains its existing per-table budget.
++constexpr std::uint32_t kViewScanLimit = 1024;
++std::uint32_t table_descriptor_count(const rt::rootsig::RootParameter& param) {
++    if (param.type != rt::rootsig::ParamType::Table || param.ranges.empty()) return 0;
++    const std::uint32_t limit = param.ranges.front().range_type == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER
++                                    ? D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE : kViewScanLimit;
+     std::uint64_t next = 0, end = 0;
+     for (const auto& range : param.ranges) {
+         const std::uint64_t start = range.offset_in_table == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND ? next
+-                                                                                                    : range.offset_in_table;
+-        const std::uint64_t count = range.num_descriptors == UINT_MAX ? kUnbounded : range.num_descriptors;
++                                                                                                  : range.offset_in_table;
++        const std::uint64_t count = range.num_descriptors == UINT_MAX ? limit : range.num_descriptors;
+         next = start + count;
+-        if (range.range_type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) end = std::max(end, next);
++        end = std::max(end, next);
+     }
+-    return std::uint32_t(std::min<std::uint64_t>(end, kUnbounded));
++    return std::uint32_t(std::min<std::uint64_t>(end, limit));
+ }
+ 
+ // memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
+@@ -967,29 +969,33 @@ struct DeviceState {
+         return true;
+     }
+ 
+-    // The shader-visible CBV/SRV/UAV heaps (arena offset -> end), for the scan of bound tables before a submission.
+-    std::mutex cbv_heap_mutex;
+-    std::map<VkDeviceSize, VkDeviceSize> cbv_heaps;
+-    static constexpr VkDeviceSize kTableScanDescriptors = 1024;  // per table and submission
++    struct ShaderVisibleHeap {
++        VkDeviceSize end;
++        D3D12_DESCRIPTOR_HEAP_TYPE type;
++    };
++    std::mutex visible_heap_mutex;
++    std::map<VkDeviceSize, ShaderVisibleHeap> visible_heaps;
+ 
+     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
+     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
+     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
+     void scan_title_table(std::uint64_t table_va, std::uint32_t descriptors) {
+         VkDeviceSize end = 0;
++        bool sampler = false;
+         {
+-            std::lock_guard lock(cbv_heap_mutex);
+-            auto it = cbv_heaps.upper_bound(table_va);
+-            if (it == cbv_heaps.begin()) return;
++            std::lock_guard lock(visible_heap_mutex);
++            auto it = visible_heaps.upper_bound(table_va);
++            if (it == visible_heaps.begin()) return;
+             --it;
+-            if (table_va >= it->second) return;
+-            end = std::min<VkDeviceSize>(
+-                it->second, table_va + VkDeviceSize(std::min<std::uint32_t>(descriptors, kTableScanDescriptors)) *
+-                                           kDescriptorSize);
++            const auto& heap = it->second;
++            if (table_va >= heap.end || (table_va - it->first) % kDescriptorSize != 0) return;
++            sampler = heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
++            const auto slots = sampler ? descriptors : std::min(descriptors, kViewScanLimit);
++            end = table_va + std::min<VkDeviceSize>(heap.end - table_va, VkDeviceSize(slots) * kDescriptorSize);
+         }
+         auto& aliases = leonida::title_va_aliases();
+-        // Slots the title wrote in its own backing of this heap, if it gave the heap one.
+         aliases.pull_descriptors(arena.mapped + table_va, std::size_t(end - table_va));
++        if (sampler) return;  // S# words describe sampling state. They have no buffer address to translate.
+         for (VkDeviceSize at = table_va; at + 16 <= end; at += kDescriptorSize) {
+             auto* w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+             const std::uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+@@ -2111,9 +2117,9 @@ public:
+             in_arena_ = true;
+             cpu_ = device.arena.mapped + arena_offset_;
+             std::memset(cpu_, 0, std::size_t(bytes));
+-            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+-                std::lock_guard lock(device.cbv_heap_mutex);
+-                device.cbv_heaps[arena_offset_] = arena_offset_ + bytes;
++            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV || desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) {
++                std::lock_guard lock(device.visible_heap_mutex);
++                device.visible_heaps[arena_offset_] = {arena_offset_ + bytes, desc.Type};
+             }
+         } else {
+             storage_.reset(new std::byte[std::size_t(bytes)]());
+@@ -2122,9 +2128,9 @@ public:
+     }
+ 
+     ~DescriptorHeap() override {
+-        if (in_arena_ && desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+-            std::lock_guard lock(device_.cbv_heap_mutex);
+-            device_.cbv_heaps.erase(arena_offset_);
++        if (in_arena_) {
++            std::lock_guard lock(device_.visible_heap_mutex);
++            device_.visible_heaps.erase(arena_offset_);
+         }
+         if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                             DeviceState::arena_descriptor_heap);
+@@ -6706,7 +6712,7 @@ public:
+             if (local_stage_layout) first = local_stage.first_sgpr[i];
+             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+-                                         table_view_descriptors(parsed.sig.params[i])});
++                                         table_descriptor_count(parsed.sig.params[i])});
+         }
+         register_static_samplers(parsed.sig);
+         auto* signature = new RootSignature(
+diff --git a/runtime/test/d3d12_m2_textured_test.cpp b/runtime/test/d3d12_m2_textured_test.cpp
+index cd9448c7..a0a9ac91 100644
+--- a/runtime/test/d3d12_m2_textured_test.cpp
++++ b/runtime/test/d3d12_m2_textured_test.cpp
+@@ -34,6 +34,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -92,7 +93,10 @@ Texel linear_clamp(UINT col, UINT row) {
+ 
+ }  // namespace
+ 
+-int main() {
++int main(int argc, char** argv) {
++    const bool unbounded = argc == 2 && std::strcmp(argv[1], "--refresh-unbounded-samplers") == 0;
++    const bool disabled = argc == 2 && std::strcmp(argv[1], "--refresh-samplers-off") == 0;
++    const bool refresh = unbounded || disabled || (argc == 2 && std::strcmp(argv[1], "--refresh-samplers") == 0);
+     vktest::Device d;
+     const auto device_status = d.initialize();
+     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
+@@ -149,7 +153,7 @@ int main() {
+ 
+         // Root signature: [0] a table of one SRV (s0:s1), [1] a table of one sampler (s2:s3).
+         D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+-        D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1, 0, 0, 0};
++        D3D12_DESCRIPTOR_RANGE sampler_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, unbounded ? UINT_MAX : 1u, 0, 0, 0};
+         D3D12_ROOT_PARAMETER params[2] = {};
+         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+         params[0].DescriptorTable = {1, &srv_range};
+@@ -263,11 +267,18 @@ int main() {
+         // The two heaps; their start handles come back in RAX (heap slots 9 and 10).
+         const D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+-        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 3,
++        const UINT sampler_slots = unbounded ? D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE : 3u;
++        const D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, sampler_slots,
+                                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+         Ref<ID3D12DescriptorHeap> srv_heap, sampler_heap;
+         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&srv_heap_desc, IID_PPV_ARGS(&srv_heap.p))));
++        if (refresh) {
++            rt::d3d12_xs::set_descriptor_heap_allocator(
++                [](std::size_t n, std::uint64_t) -> void* { return std::calloc(1, n); },
++                [](void* p, std::uint64_t) { std::free(p); });
++        }
+         EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&sampler_heap_desc, IID_PPV_ARGS(&sampler_heap.p))));
++        if (refresh) rt::d3d12_xs::set_descriptor_heap_allocator(nullptr, nullptr);
+         const std::uint64_t srv_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 9))(srv_heap.p);
+         const std::uint64_t srv_gpu = reinterpret_cast<XboxHeapHandleFn>(slot(srv_heap.p, 10))(srv_heap.p);
+         const std::uint64_t sampler_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(sampler_heap.p, 9))(sampler_heap.p);
+@@ -302,6 +313,13 @@ int main() {
+         device->CreateSampler(&sampler_desc, D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(sampler_cpu + 2 * sampler_step)});
+ 
+ 
++        // Seed the game backing directly so the submission test is independent of API write-through.
++        const auto sampler_real = rt::d3d12_xs::translate_cpu_descriptor_handle(device.p, {SIZE_T(sampler_cpu)});
++        if (refresh) {
++            EXPECT(sampler_real.ptr && sampler_real.ptr != sampler_cpu);
++            std::memcpy(reinterpret_cast<void*>(sampler_cpu), reinterpret_cast<const void*>(sampler_real.ptr), 3 * sampler_step);
++        }
++
+         // The hash table, after the descriptors were created and before anything has run: a T# is 8 dwords of the
+         // heap slot, an S# 4 dwords followed by 0xFFFFFFFF x4. Each of the three has an index, they differ, and
+         // bytes nothing was created for have none.
+@@ -460,6 +478,50 @@ int main() {
+         EXPECT(SUCCEEDED(readback2->Map(0, nullptr, &mapped2)));
+         std::memcpy(control_pixels.data(), mapped2, control_pixels.size());
+ 
++        if (refresh) {
++            // Only CPU stores reach the game's backing after the control list has closed. Both samplers
++            // already have hash entries. The offset texture coordinates distinguish their address modes.
++            auto* title = reinterpret_cast<std::uint8_t*>(sampler_cpu);
++            const auto* mapped_heap = reinterpret_cast<const std::uint8_t*>(sampler_real.ptr);
++            const std::vector<std::uint8_t> original(mapped_heap, mapped_heap + 3 * sampler_step);
++            EXPECT(std::memcmp(original.data(), original.data() + sampler_step, sampler_step) != 0);
++            readback2->Unmap(0, nullptr);
++            const SIZE_T last = SIZE_T(sampler_slots - 1) * sampler_step;
++            bool extent_matches = true;
++            unsigned matches[2]{};
++            for (unsigned pass = 0; pass < 2; ++pass) {
++                const bool swapped = pass == 0;
++                for (unsigned slot = 0; slot < 2; ++slot)
++                    std::memcpy(title + slot * sampler_step, original.data() + (swapped ? 1 - slot : slot) * sampler_step,
++                                sampler_step);
++                // An unbounded table reaches the heap's last slot. For one-slot tables this is a guard slot.
++                std::memcpy(title + last, original.data() + pass * sampler_step, sampler_step);
++                queue->ExecuteCommandLists(1, lists2);
++                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
++                EXPECT(SUCCEEDED(queue->Signal(fence.p, 3 + pass)));
++                EXPECT(SUCCEEDED(fence->SetEventOnCompletion(3 + pass, nullptr)));
++                const auto* expected_last = original.data() + (unbounded ? pass : 2u) * sampler_step;
++                extent_matches &= std::memcmp(mapped_heap + last, expected_last, sampler_step) == 0;
++                EXPECT(SUCCEEDED(readback2->Map(0, nullptr, &mapped2)));
++                for (UINT y = 0; y < target_size; ++y) {
++                    for (UINT x = 0; x < target_size; ++x) {
++                        const bool left = x < target_size / 2;
++                        const bool wraps = (swapped && !disabled) ? !left : left;
++                        const UINT tx = wraps ? x * texture_size / target_size : texture_size - 1;
++                        const UINT ty = y * texture_size / target_size;
++                        const Texel want = left ? gradient(tx, ty) : reflected(tx, ty);
++                        const auto* pixel = static_cast<const std::uint8_t*>(mapped2) + y * target_pitch + 4 * x;
++                        matches[pass] += std::memcmp(pixel, want.data(), 4) == 0;
++                    }
++                }
++                readback2->Unmap(0, nullptr);
++            }
++            std::printf("resubmitted sampler tables: %u/%u swapped, %u/%u restored\n", matches[0],
++                        target_size * target_size, matches[1], target_size * target_size);
++            std::printf("sampler slot %u: %s\n", sampler_slots - 1, extent_matches ? "matched" : "mismatch");
++            EXPECT(extent_matches && matches[0] == target_size * target_size && matches[1] == target_size * target_size);
++        }
++
+         // The entries are still there after the draws.
+         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key_a) == index_a);
+         EXPECT(rt::d3d12::bindless_hash_lookup(device.p, key_s) == index_s);
+-- 
+2.56.1
+
