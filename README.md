@@ -103,6 +103,12 @@ python3 -I tests/test_ps_front_face.py
 LEONIDA_VK_HARNESS=/absolute/path/to/vk_harness python3 -I tests/test_ps_front_face_gpu.py
 ```
 
+## Index buffer view bounds in Vulkan replay
+
+Apply [index-view-bounds.mbox](index-view-bounds.mbox) with `git am` to the base commit. This mailbox preserves tedin7’s six commits from [PR 326](https://github.com/ubiquitarianism/leonida/pull/326). Its standalone tree is `049288a4fe5ac64628d2fe42e6f3140028165fc0`.
+
+Indexed draws now preserve indices inside a view and read zero beyond its end. A native RTX 4070 Ti readback reproduced eight wrong images on the original replay. All ten images matched after the fix, with synchronization validation enabled. [Test source, results and reproduction instructions](tests/index-view/README.md)
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.

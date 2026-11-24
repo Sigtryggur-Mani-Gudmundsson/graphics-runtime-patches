@@ -1,0 +1,637 @@
+From 3cc81fb7ecd566db9dfa0ff04670419777935dea Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Mon, 23 Nov 2026 18:30:24 +0100
+Subject: [PATCH 1/6] fix: index buffer view SizeInBytes bounds the index
+ fetch; reads outside the view are 0
+
+
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index 7d629053f8697d5834092c3be38cbe4d2e2800b7..a2c2335c16dccec830aa0eae4e5a9ab69b67653b 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -1089,6 +1089,7 @@ struct PreparedDraw {
+     VkBuffer index_buffer = VK_NULL_HANDLE;
+     VkDeviceSize index_offset = 0;
+     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
++    std::uint32_t index_first = 0;  // firstIndex to draw with: the draw's, or 0 on the zero page (see prepare)
+     VkExtent2D area{};
+     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+ 
+@@ -1105,6 +1106,7 @@ struct PreparedDraw {
+         index_buffer = VK_NULL_HANDLE;
+         index_offset = 0;
+         index_type = VK_INDEX_TYPE_UINT16;
++        index_first = 0;
+         area = {};
+         layers = 1;
+     }
+@@ -2221,14 +2223,30 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
+         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
+         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
+         else if (draw.index.va) return ReplayResult::unsupported;
+-        if (!draw.index.va) {  // no index buffer: every index reads 0
+-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+-            p.index_buffer = vk.zero_buffer;
+-            p.index_offset = vk.zero_offset;
+-        } else {
++        p.index_first = draw.first;
++        // Index fetches outside the view read 0 in D3D12, but vkCmdBindIndexBuffer binds to the end of the buffer
++        // (the layer's device does not enable VK_KHR_maintenance5 for a bind size). So the view's size decides
++        // here: a draw wholly inside binds the buffer, one wholly outside binds the zero page, and one that
++        // straddles the end is refused rather than reading bytes the view does not cover.
++        const std::uint64_t index_bytes = p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
++        std::uint64_t view_indices = 0;
++        bool resolved = false;
++        if (draw.index.va) {
+             std::uint64_t size = draw.index.size;
+             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+                 return ReplayResult::unresolved_resource;
++            view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
++            resolved = true;
++        }
++        const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
++        if (resolved && draw.count > 0 && last > view_indices && draw.first < view_indices)
++            return ReplayResult::unsupported;
++        if (!resolved || (draw.count > 0 && draw.first >= view_indices)) {  // every index reads 0
++            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
++            if (resolved && std::uint64_t(draw.count) * index_bytes > vk.zero_size) return ReplayResult::unsupported;
++            p.index_buffer = vk.zero_buffer;
++            p.index_offset = vk.zero_offset;
++            p.index_first = 0;
+         }
+     }
+     return ReplayResult::success;
+@@ -4233,7 +4251,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+             } else if (draw->indexed) {
+                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
+-                vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
++                vk.draw_indexed(command_buffer, draw->count, draw->instances, d.index_first, draw->base_vertex,
+                                 draw->first_instance);
+             } else {
+                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+diff --git a/runtime/test/d3d12_draw_test.cpp b/runtime/test/d3d12_draw_test.cpp
+index 36e2f6e37aba33aa8e86c98e3f950b9d6a33604d..0592827f5aec4eeac19fb076a8407a929d62b0b9 100644
+--- a/runtime/test/d3d12_draw_test.cpp
++++ b/runtime/test/d3d12_draw_test.cpp
+@@ -106,6 +106,8 @@ int main() {
+     constexpr UINT size = 64;
+     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256), logic_pixels(size * 256);
+     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
++    // Index buffer view size: a fetch past SizeInBytes reads index 0 (view_out), one inside the view reads the data.
++    std::vector<std::uint8_t> view_out_pixels(size * 256), view_in_pixels(size * 256), view_straddle_pixels(size * 256);
+     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
+     bool ran_msaa = false;
+     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
+@@ -532,6 +534,10 @@ int main() {
+             std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1280, strip_idx16, sizeof(strip_idx16));
+             std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1536, strip_idx32, sizeof(strip_idx32));
+             std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1792, strip_nocut, sizeof(strip_nocut));
++            // Four indices of the top-left quad, then the same four again: the second half is the data a draw would
++            // read if the view's end were ignored.
++            const std::uint16_t view_idx[8] = {0, 1, 2, 3, 0, 1, 2, 3};
++            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 3072, view_idx, sizeof(view_idx));
+             upload->Unmap(0, nullptr);
+ 
+             auto strip_desc = pso_desc;
+@@ -550,11 +556,20 @@ int main() {
+                 D3D12_INDEX_BUFFER_VIEW ibv;
+                 UINT index_count;
+                 std::vector<std::uint8_t>* out;
++                UINT first = 0;  // StartIndexLocation
++                leonida::ReplayResult want = leonida::ReplayResult::success;
+             };
+             const StripPass strip_passes[] = {
+                 {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels},
+                 {strip32_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9, &strip32_pixels},
+                 {strip_off_pso.p, {upload_va + 1792, sizeof(strip_nocut), DXGI_FORMAT_R16_UINT}, 8, &strip_nocut_pixels},
++                // View of 4 indices, draw of indices 4..7: all outside the view, so all read 0 (a degenerate strip).
++                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_out_pixels, 4},
++                // Negative control: the view covers the 8 indices, the same draw reads the quad.
++                {strip_off_pso.p, {upload_va + 3072, 16, DXGI_FORMAT_R16_UINT}, 4, &view_in_pixels, 4},
++                // Indices 2..5 cross the view's end: refused, nothing is read outside the view.
++                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2,
++                 leonida::ReplayResult::unsupported},
+             };
+             UINT64 strip_fence = 10;
+             for (const auto& sp : strip_passes) {
+@@ -570,15 +585,15 @@ int main() {
+                 list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                 list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                 list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+-                list->DrawIndexedInstanced(sp.index_count, 1, 0, 0, 0);
++                list->DrawIndexedInstanced(sp.index_count, 1, sp.first, 0, 0);
+                 list->ResourceBarrier(1, &to_copy);
+                 list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                 EXPECT(list->Close() == S_OK);
+                 queue->ExecuteCommandLists(1, lists);
+-                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                 ++strip_fence;
+                 EXPECT(SUCCEEDED(queue->Signal(fence.p, strip_fence)) &&
+                        SUCCEEDED(fence->SetEventOnCompletion(strip_fence, nullptr)));
++                EXPECT(rt::d3d12::last_execute_result(queue.p) == sp.want);
+                 std::memcpy(sp.out->data(), mapped, sp.out->size());
+             }
+         }
+@@ -1106,6 +1121,20 @@ int main() {
+     }
+     EXPECT(!mismatches);
+     EXPECT(nocut_bl_red > 0);
++    // Index buffer view size: past the view's end every fetch reads 0 (nothing drawn), inside it the data is read.
++    UINT view_out_red = 0, view_in_tl_red = 0;
++    for (UINT row = 0; row < size; ++row) {
++        for (UINT col = 0; col < size; ++col) {
++            const std::uint8_t* out = view_out_pixels.data() + row * 256 + col * 4;
++            const std::uint8_t* in = view_in_pixels.data() + row * 256 + col * 4;
++            if (out[0] == 255) ++view_out_red;
++            if (row < size / 2 && col < size / 2 && in[0] == 255 && in[2] == 0) ++view_in_tl_red;
++        }
++    }
++    EXPECT(view_out_red == 0);
++    EXPECT(view_in_tl_red == (size / 2) * (size / 2));
++    std::printf("index view size: draw past the view painted %u red pixels (want 0); view covering the draw painted "
++                "%u of %u top-left pixels\n", view_out_red, view_in_tl_red, (size / 2) * (size / 2));
+     std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
+                 "bridge pixels in bottom-left)\n",
+                 nocut_bl_red);
+
+From aed55524702b961bfacacc6421ea24617d532b18 Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Mon, 23 Nov 2026 18:33:45 +0100
+Subject: [PATCH 2/6] fix: a draw that crosses the index view's end reads index
+ 0 past it, from a staged copy
+
+
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index a2c2335c16dccec830aa0eae4e5a9ab69b67653b..4a800fb5f6f1a46d99004a94221434f291b326d1 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -1089,7 +1089,15 @@ struct PreparedDraw {
+     VkBuffer index_buffer = VK_NULL_HANDLE;
+     VkDeviceSize index_offset = 0;
+     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+-    std::uint32_t index_first = 0;  // firstIndex to draw with: the draw's, or 0 on the zero page (see prepare)
++    std::uint32_t index_first = 0;  // firstIndex to draw with: the draw's, or 0 on the zero page or a staged copy
++    // A draw that reads past the index view's end binds a scratch copy of the indices it fetches instead: the
++    // in-view part copied from the buffer, the rest zero. fill_bytes 0: no copy.
++    struct IndexStage {
++        VkBuffer scratch = VK_NULL_HANDLE;
++        VkDeviceSize scratch_offset = 0, fill_bytes = 0;
++        VkBuffer source = VK_NULL_HANDLE;
++        VkDeviceSize source_offset = 0, copy_bytes = 0;
++    } index_stage;
+     VkExtent2D area{};
+     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+ 
+@@ -1107,6 +1115,7 @@ struct PreparedDraw {
+         index_offset = 0;
+         index_type = VK_INDEX_TYPE_UINT16;
+         index_first = 0;
++        index_stage = {};
+         area = {};
+         layers = 1;
+     }
+@@ -2224,29 +2233,44 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
+         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
+         else if (draw.index.va) return ReplayResult::unsupported;
+         p.index_first = draw.first;
+-        // Index fetches outside the view read 0 in D3D12, but vkCmdBindIndexBuffer binds to the end of the buffer
+-        // (the layer's device does not enable VK_KHR_maintenance5 for a bind size). So the view's size decides
+-        // here: a draw wholly inside binds the buffer, one wholly outside binds the zero page, and one that
+-        // straddles the end is refused rather than reading bytes the view does not cover.
++        // Index fetches outside the view read 0 in D3D12, but vkCmdBindIndexBuffer binds to the end of the buffer (the
++        // layer's device does not enable VK_KHR_maintenance5 for a bind size). A draw wholly inside the view binds
++        // the buffer. One that reads past the view's end binds the zero page when every index is outside, else a
++        // scratch copy of the indices it fetches (in-view part copied, the rest zero), so no byte past the view is read.
+         const std::uint64_t index_bytes = p.index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+         std::uint64_t view_indices = 0;
+-        bool resolved = false;
+         if (draw.index.va) {
+             std::uint64_t size = draw.index.size;
+             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
+                 return ReplayResult::unresolved_resource;
+             view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
+-            resolved = true;
+         }
+         const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
+-        if (resolved && draw.count > 0 && last > view_indices && draw.first < view_indices)
+-            return ReplayResult::unsupported;
+-        if (!resolved || (draw.count > 0 && draw.first >= view_indices)) {  // every index reads 0
++        if (!draw.index.va) {
+             if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+-            if (resolved && std::uint64_t(draw.count) * index_bytes > vk.zero_size) return ReplayResult::unsupported;
+             p.index_buffer = vk.zero_buffer;
+             p.index_offset = vk.zero_offset;
+             p.index_first = 0;
++        } else if (draw.count > 0 && last > view_indices) {
++            const std::uint64_t inside = draw.first < view_indices ? view_indices - draw.first : 0;
++            const std::uint64_t bytes = std::uint64_t(draw.count) * index_bytes;
++            if (inside == 0 && vk.zero_buffer && bytes <= vk.zero_size) {
++                p.index_buffer = vk.zero_buffer;
++                p.index_offset = vk.zero_offset;
++                p.index_first = 0;
++            } else {
++                if (!vk.copy_scratch || !vk.fill_buffer || !vk.copy_buffer) return ReplayResult::unsupported;
++                const std::uint64_t fill = (bytes + 3) & ~std::uint64_t(3);  // vkCmdFillBuffer: multiples of 4
++                VkBuffer scratch = VK_NULL_HANDLE;
++                VkDeviceSize offset = 0;
++                if (!vk.copy_scratch(fill + 4, scratch, offset)) return ReplayResult::unsupported;
++                offset = (offset + 3) & ~VkDeviceSize(3);  // also a multiple of the index size
++                p.index_stage = {scratch, offset, fill, p.index_buffer,
++                                 p.index_offset + VkDeviceSize(draw.first) * index_bytes, inside * index_bytes};
++                p.index_buffer = scratch;
++                p.index_offset = offset;
++                p.index_first = 0;
++            }
+         }
+     }
+     return ReplayResult::success;
+@@ -4206,6 +4230,21 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
+             const GraphicsPipeline& graphics = *d.graphics;
+             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
+             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
++            if (d.index_stage.fill_bytes) {
++                const auto& stage = d.index_stage;
++                constexpr VkAccessFlags transfer_rw = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++                detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               transfer_rw, VK_PIPELINE_STAGE_TRANSFER_BIT);
++                vk.fill_buffer(command_buffer, stage.scratch, stage.scratch_offset, stage.fill_bytes, 0);
++                if (stage.copy_bytes) {
++                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                                   transfer_rw, VK_PIPELINE_STAGE_TRANSFER_BIT);
++                    const VkBufferCopy region{stage.source_offset, stage.scratch_offset, stage.copy_bytes};
++                    vk.copy_buffer(command_buffer, stage.source, stage.scratch, 1, &region);
++                }
++                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               VK_ACCESS_INDEX_READ_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT);
++            }
+             vk.begin_rendering(command_buffer, &rendering);
+ 
+             ShaderUserData data{};
+diff --git a/runtime/test/d3d12_draw_test.cpp b/runtime/test/d3d12_draw_test.cpp
+index 0592827f5aec4eeac19fb076a8407a929d62b0b9..87692677180ecc85c8ea84d1baebeeeb5ffb3752 100644
+--- a/runtime/test/d3d12_draw_test.cpp
++++ b/runtime/test/d3d12_draw_test.cpp
+@@ -567,9 +567,10 @@ int main() {
+                 {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_out_pixels, 4},
+                 // Negative control: the view covers the 8 indices, the same draw reads the quad.
+                 {strip_off_pso.p, {upload_va + 3072, 16, DXGI_FORMAT_R16_UINT}, 4, &view_in_pixels, 4},
+-                // Indices 2..5 cross the view's end: refused, nothing is read outside the view.
+-                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2,
+-                 leonida::ReplayResult::unsupported},
++                // Indices 2..5 cross the view's end: 2 and 3 are read, 4 and 5 are outside and read 0, so the strip is
++                // (2, 3, 0, 0): one triangle (2, 3, 0) of the top-left quad. Without the cut the buffer's 0, 1 would
++                // give (2, 3, 0, 1), the whole quad.
++                {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2},
+             };
+             UINT64 strip_fence = 10;
+             for (const auto& sp : strip_passes) {
+@@ -1132,6 +1133,11 @@ int main() {
+         }
+     }
+     EXPECT(view_out_red == 0);
++    // Straddling draw: the strip is (2, 3, 0, 0), the lower-left half of the quad; the buffer's own 0, 1 would also
++    // paint the upper-right half.
++    const auto straddle_px = [&](UINT col, UINT row) { return view_straddle_pixels.data() + row * 256 + col * 4; };
++    EXPECT(straddle_px(4, 28)[0] == 255 && straddle_px(4, 28)[2] == 0);  // lower-left corner of the quad: drawn
++    EXPECT(straddle_px(28, 4)[0] == 0 && straddle_px(28, 4)[2] == 255);   // upper-right corner: blue
+     EXPECT(view_in_tl_red == (size / 2) * (size / 2));
+     std::printf("index view size: draw past the view painted %u red pixels (want 0); view covering the draw painted "
+                 "%u of %u top-left pixels\n", view_out_red, view_in_tl_red, (size / 2) * (size / 2));
+
+From 0ddc28cc06c52a08395b06f2ce089517847de748 Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Mon, 23 Nov 2026 18:35:20 +0100
+Subject: [PATCH 3/6] fix: scratch buffers allow index-buffer use for the
+ staged index copy
+
+
+diff --git a/runtime/src/vulkan_scratch.h b/runtime/src/vulkan_scratch.h
+index 4a8a59ddd71b2cd4585f757e0ebddad4fc7ca58d..b656a950743a0a0c84bb1f53939b90f64e66a404 100644
+--- a/runtime/src/vulkan_scratch.h
++++ b/runtime/src/vulkan_scratch.h
+@@ -148,7 +148,8 @@ private:
+     bool make_chunk(std::uint64_t size, Chunk& out) {
+         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+         info.size = size;
+-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++        // INDEX_BUFFER: a draw that reads past its index view's end binds a staged copy (vulkan_replay.h, prepare).
++        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
+         VkMemoryRequirements requirements{};
+         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
+
+From b936f7f20ae2216f4a066781641cfc36a58246b4 Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Mon, 23 Nov 2026 18:50:30 +0100
+Subject: [PATCH 4/6] fix: bound null index views to zero page
+
+
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index 4a800fb5f6f1a46d99004a94221434f291b326d1..78b597ae2d98499b6ca9fb0be28724b0fc0295fb 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -2246,12 +2246,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
+             view_indices = size / index_bytes;  // size is the view's, cut at the buffer's end
+         }
+         const std::uint64_t last = std::uint64_t(draw.first) + draw.count;  // one past the last index fetched
+-        if (!draw.index.va) {
+-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+-            p.index_buffer = vk.zero_buffer;
+-            p.index_offset = vk.zero_offset;
+-            p.index_first = 0;
+-        } else if (draw.count > 0 && last > view_indices) {
++        if (!draw.index.va || (draw.count > 0 && last > view_indices)) {
+             const std::uint64_t inside = draw.first < view_indices ? view_indices - draw.first : 0;
+             const std::uint64_t bytes = std::uint64_t(draw.count) * index_bytes;
+             if (inside == 0 && vk.zero_buffer && bytes <= vk.zero_size) {
+diff --git a/runtime/test/d3d12_draw_test.cpp b/runtime/test/d3d12_draw_test.cpp
+index 87692677180ecc85c8ea84d1baebeeeb5ffb3752..cda71779793e1c062b7a2513c970368eae37fec9 100644
+--- a/runtime/test/d3d12_draw_test.cpp
++++ b/runtime/test/d3d12_draw_test.cpp
+@@ -108,6 +108,7 @@ int main() {
+     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
+     // Index buffer view size: a fetch past SizeInBytes reads index 0 (view_out), one inside the view reads the data.
+     std::vector<std::uint8_t> view_out_pixels(size * 256), view_in_pixels(size * 256), view_straddle_pixels(size * 256);
++    std::vector<std::uint8_t> null_ib_pixels(size * 256), zero_ib_pixels(size * 256), live_ib_pixels(size * 256);
+     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
+     bool ran_msaa = false;
+     std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
+@@ -134,6 +135,30 @@ int main() {
+                                                            reinterpret_cast<void**>(&device.p))));
+         rt::d3d12::set_device_outer(inner, device.p);
+ 
++        // First arena allocation follows the 64 KiB zero page. A broken null-IBV bind can fetch these indices.
++        constexpr UINT large_index_count = 40000;
++        const D3D12_HEAP_PROPERTIES index_upload_heap{D3D12_HEAP_TYPE_UPLOAD};
++        const D3D12_HEAP_PROPERTIES index_default_heap{D3D12_HEAP_TYPE_DEFAULT};
++        const auto large_index_desc = buffer_desc(large_index_count * sizeof(std::uint16_t));
++        Ref<ID3D12Resource> live_indices, index_upload, zero_indices;
++        EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_default_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
++                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                                         IID_PPV_ARGS(&live_indices.p))));
++        EXPECT(live_indices->GetGPUVirtualAddress() == 64 * 1024);
++        EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_upload_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
++                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
++                                                         IID_PPV_ARGS(&index_upload.p))));
++        EXPECT(SUCCEEDED(device->CreateCommittedResource(&index_upload_heap, D3D12_HEAP_FLAG_NONE, &large_index_desc,
++                                                         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
++                                                         IID_PPV_ARGS(&zero_indices.p))));
++        void* index_data = nullptr;
++        EXPECT(SUCCEEDED(index_upload->Map(0, nullptr, &index_data)));
++        for (UINT i = 0; i < large_index_count; ++i) static_cast<std::uint16_t*>(index_data)[i] = i % 4;
++        index_upload->Unmap(0, nullptr);
++        EXPECT(SUCCEEDED(zero_indices->Map(0, nullptr, &index_data)));
++        std::memset(index_data, 0, large_index_count * sizeof(std::uint16_t));
++        zero_indices->Unmap(0, nullptr);
++
+         // Root signature: [0] two constants (s0, s1: offset), [1] a root CBV (s2:s3: tint).
+         D3D12_ROOT_PARAMETER params[2] = {};
+         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+@@ -369,6 +394,10 @@ int main() {
+         EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+ 
+         // Upload the vertices, prepare the target.
++        list->CopyBufferRegion(live_indices.p, 0, index_upload.p, 0, large_index_count * sizeof(std::uint16_t));
++        const auto indices_ready = transition(live_indices.p, D3D12_RESOURCE_STATE_COPY_DEST,
++                                              D3D12_RESOURCE_STATE_INDEX_BUFFER);
++        list->ResourceBarrier(1, &indices_ready);
+         list->CopyBufferRegion(vertex_buffer.p, 0, upload.p, 0, sizeof(vertices));
+         D3D12_RESOURCE_BARRIER barriers[2] = {
+             transition(vertex_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
+@@ -558,6 +587,7 @@ int main() {
+                 std::vector<std::uint8_t>* out;
+                 UINT first = 0;  // StartIndexLocation
+                 leonida::ReplayResult want = leonida::ReplayResult::success;
++                bool bind_index = true;
+             };
+             const StripPass strip_passes[] = {
+                 {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels},
+@@ -571,6 +601,11 @@ int main() {
+                 // (2, 3, 0, 0): one triangle (2, 3, 0) of the top-left quad. Without the cut the buffer's 0, 1 would
+                 // give (2, 3, 0, 1), the whole quad.
+                 {strip_off_pso.p, {upload_va + 3072, 8, DXGI_FORMAT_R16_UINT}, 4, &view_straddle_pixels, 2},
++                {strip_off_pso.p, {}, large_index_count, &null_ib_pixels, 0, leonida::ReplayResult::success, false},
++                {strip_off_pso.p, {zero_indices->GetGPUVirtualAddress(), large_index_count * 2, DXGI_FORMAT_R16_UINT},
++                 large_index_count, &zero_ib_pixels},
++                {strip_off_pso.p, {live_indices->GetGPUVirtualAddress(), large_index_count * 2, DXGI_FORMAT_R16_UINT},
++                 large_index_count, &live_ib_pixels},
+             };
+             UINT64 strip_fence = 10;
+             for (const auto& sp : strip_passes) {
+@@ -580,7 +615,7 @@ int main() {
+                 list->SetGraphicsRootSignature(root.p);
+                 list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                 list->IASetVertexBuffers(0, 1, &strip_vbv);
+-                list->IASetIndexBuffer(&sp.ibv);
++                if (sp.bind_index) list->IASetIndexBuffer(&sp.ibv);
+                 list->RSSetViewports(1, &viewport);
+                 list->RSSetScissorRects(1, &scissor);
+                 list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+@@ -1133,6 +1168,18 @@ int main() {
+         }
+     }
+     EXPECT(view_out_red == 0);
++    UINT null_red = 0, zero_red = 0, live_red = 0;
++    for (UINT row = 0; row < size; ++row) {
++        for (UINT col = 0; col < size; ++col) {
++            const UINT offset = row * 256 + col * 4;
++            null_red += null_ib_pixels[offset] == 255;
++            zero_red += zero_ib_pixels[offset] == 255;
++            live_red += live_ib_pixels[offset] == 255;
++        }
++    }
++    EXPECT(null_red == 0 && zero_red == 0 && live_red > 0);
++    std::printf("40000 indices: null view %u red, zero view %u red, live view %u red\n",
++                null_red, zero_red, live_red);
+     // Straddling draw: the strip is (2, 3, 0, 0), the lower-left half of the quad; the buffer's own 0, 1 would also
+     // paint the upper-right half.
+     const auto straddle_px = [&](UINT col, UINT row) { return view_straddle_pixels.data() + row * 256 + col * 4; };
+
+From 20ff83f85a68da43599e50e579455562ea03fb99 Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Mon, 23 Nov 2026 18:56:08 +0100
+Subject: [PATCH 5/6] test: the null index view test releases its buffers
+ before the device proxy reference check
+
+
+diff --git a/runtime/test/d3d12_draw_test.cpp b/runtime/test/d3d12_draw_test.cpp
+index cda71779793e1c062b7a2513c970368eae37fec9..bc470d5ec7d0acedf4f9e667d4ab2cfc6abadbbc 100644
+--- a/runtime/test/d3d12_draw_test.cpp
++++ b/runtime/test/d3d12_draw_test.cpp
+@@ -1070,7 +1070,8 @@ int main() {
+         list->OMSetRenderTargets(9, &rtv, TRUE, nullptr);
+         EXPECT(list->Close() == E_INVALIDARG);
+ 
+-        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
++        for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target, &live_indices, &index_upload, &zero_indices})
++            r->reset();
+         for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
+         pso.reset();
+         root.reset();
+
+From 953c5a698cabbdfa60a2843577565e7fa20049a3 Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Tue, 24 Nov 2026 00:35:54 +0100
+Subject: [PATCH 6/6] test: replay_index_view_test covers the index view bounds
+ in prepare_draw without a GPU
+
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 2e8eed7018859e3873445db82e038df0caa309bf..58bee19244c48585eeacd1515d4baed696fccb1f 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -3211,6 +3211,13 @@ if(TARGET Vulkan::Headers)
+       target_compile_definitions(replay_copy_offset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+     endif()
+     add_test(NAME replay_copy_offset COMMAND replay_copy_offset_test)
++    # An indexed draw's index buffer view size bounds the index fetch: past the view reads 0 (no GPU).
++    add_executable(replay_index_view_test test/replay_index_view_test.cpp)
++    target_link_libraries(replay_index_view_test PRIVATE Vulkan::Headers)
++    if(WIN32)
++      target_compile_definitions(replay_index_view_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
++    endif()
++    add_test(NAME replay_index_view COMMAND replay_index_view_test)
+     # KHR CopyRaytracingAccelerationStructure (CLONE, COMPACT) and COMPACTED_SIZE postbuild (no GPU).
+     add_executable(replay_khr_as_copy_postbuild_test test/replay_khr_as_copy_postbuild_test.cpp)
+     target_link_libraries(replay_khr_as_copy_postbuild_test PRIVATE Vulkan::Headers)
+diff --git a/runtime/test/replay_index_view_test.cpp b/runtime/test/replay_index_view_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cd5fe9e079da12c56f1ccb12dcf815173cb7c8e
+--- /dev/null
++++ b/runtime/test/replay_index_view_test.cpp
+@@ -0,0 +1,134 @@
++// An indexed draw's index buffer view SizeInBytes bounds the index fetch (D3D12: a fetch past the view reads 0).
++// prepare_draw decides, from the view and the draw's StartIndexLocation/IndexCount, whether to bind the buffer, the
++// zero page, or a staged copy that holds only the in-view indices. No Vulkan loader, GPU or game data.
++#include "../src/vulkan_replay.h"
++
++#include <cstdint>
++#include <cstdio>
++
++namespace {
++
++void dummy() {}
++
++template<typename T>
++T stub() {
++    return reinterpret_cast<T>(&dummy);
++}
++
++template<typename T>
++T handle(std::uintptr_t n) {
++    return reinterpret_cast<T>(n);
++}
++
++int failures = 0;
++void expect(bool ok, const char* what) {
++    if (!ok) {
++        std::fprintf(stderr, "FAIL: %s\n", what);
++        ++failures;
++    }
++}
++
++constexpr std::uint64_t ib_va = 0x10000;
++constexpr std::uint32_t dxgi_r16_uint = 57;
++
++}  // namespace
++
++int main() {
++    using namespace leonida;
++    using detail::PreparedDraw;
++
++    const VkBuffer index_buffer = handle<VkBuffer>(0x1111);
++    const VkBuffer zero_buffer = handle<VkBuffer>(0x2222);
++    const VkBuffer scratch_buffer = handle<VkBuffer>(0x3333);
++
++    GraphicsPipeline pipeline;
++    pipeline.pipeline = handle<VkPipeline>(0x4444);
++
++    ReplayFunctions vk{};
++    vk.begin_rendering = stub<PFN_vkCmdBeginRendering>();
++    vk.end_rendering = stub<PFN_vkCmdEndRendering>();
++    vk.copy_buffer = stub<PFN_vkCmdCopyBuffer>();
++    vk.fill_buffer = stub<PFN_vkCmdFillBuffer>();
++    vk.bind_pipeline = stub<PFN_vkCmdBindPipeline>();
++    vk.push_constants = stub<PFN_vkCmdPushConstants>();
++    vk.bind_vertex_buffers2 = stub<PFN_vkCmdBindVertexBuffers2>();
++    vk.bind_index_buffer = stub<PFN_vkCmdBindIndexBuffer>();
++    vk.set_viewport = stub<PFN_vkCmdSetViewport>();
++    vk.set_scissor = stub<PFN_vkCmdSetScissor>();
++    vk.set_primitive_topology = stub<PFN_vkCmdSetPrimitiveTopology>();
++    vk.set_primitive_restart_enable = stub<PFN_vkCmdSetPrimitiveRestartEnable>();
++    vk.set_stencil_reference = stub<PFN_vkCmdSetStencilReference>();
++    vk.set_blend_constants = stub<PFN_vkCmdSetBlendConstants>();
++    vk.draw = stub<PFN_vkCmdDraw>();
++    vk.draw_indexed = stub<PFN_vkCmdDrawIndexed>();
++    vk.graphics_pipeline = [&](std::uintptr_t) { return &pipeline; };
++    vk.image_view = [](const ResourceBinding&, const VkImageSubresourceRange&) { return VkImageView(VK_NULL_HANDLE); };
++    // The index buffer is 8 indices (16 bytes) of the arena; a view is cut at the buffer's end.
++    vk.buffer_at = [&](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
++        if (va != ib_va) return false;
++        size = std::min<std::uint64_t>(size, 16);
++        buffer = index_buffer;
++        offset = 0;
++        return true;
++    };
++    vk.zero_buffer = zero_buffer;
++    vk.zero_offset = 0;
++    vk.zero_size = 64;
++    vk.copy_scratch = [&](VkDeviceSize, VkBuffer& buffer, VkDeviceSize& offset) {
++        buffer = scratch_buffer;
++        offset = 0;
++        return true;
++    };
++    const auto no_resource = [](auto) -> const ResourceBinding* { return nullptr; };
++
++    const auto prepare = [&](std::uint64_t va, std::uint32_t view_bytes, std::uint32_t first, std::uint32_t count,
++                             PreparedDraw& p) {
++        Draw draw;
++        draw.indexed = true;
++        draw.index = {va, view_bytes, dxgi_r16_uint};
++        draw.first = first;
++        draw.count = count;
++        draw.instances = 1;
++        return detail::prepare_draw(draw, no_resource, vk, p);
++    };
++
++    {  // View of 4 indices, draw of indices 0..3: wholly inside, the buffer is bound as it is.
++        PreparedDraw p;
++        expect(prepare(ib_va, 8, 0, 4, p) == ReplayResult::success, "inside: success");
++        expect(p.index_buffer == index_buffer && p.index_first == 0 && p.index_stage.fill_bytes == 0,
++               "inside: the buffer is bound, no staging");
++    }
++    {  // View of 4 indices, draw of indices 4..7: all outside, every index reads 0, from the zero page.
++        PreparedDraw p;
++        expect(prepare(ib_va, 8, 4, 4, p) == ReplayResult::success, "outside: success");
++        expect(p.index_buffer == zero_buffer && p.index_first == 0 && p.index_stage.fill_bytes == 0,
++               "outside: the zero page is bound, not the buffer's second half");
++    }
++    {  // View of 4 indices, draw of indices 2..5: 2 and 3 are read, 4 and 5 read 0.
++        PreparedDraw p;
++        expect(prepare(ib_va, 8, 2, 4, p) == ReplayResult::success, "straddle: success");
++        expect(p.index_buffer == scratch_buffer && p.index_first == 0, "straddle: a staged copy is bound");
++        expect(p.index_stage.source == index_buffer && p.index_stage.source_offset == 4 &&
++                   p.index_stage.copy_bytes == 4,
++               "straddle: only the 2 in-view indices (4 bytes at byte 4) are copied");
++    }
++    {  // No index buffer bound: every index reads 0.
++        PreparedDraw p;
++        expect(prepare(0, 0, 0, 16, p) == ReplayResult::success, "null view: success");
++        expect(p.index_buffer == zero_buffer && p.index_first == 0 && p.index_stage.fill_bytes == 0,
++               "null view: the zero page is bound");
++    }
++    {  // No index buffer bound, a draw larger than the zero page: staged zeros, never the arena after the page.
++        PreparedDraw p;
++        expect(prepare(0, 0, 0, 100, p) == ReplayResult::success, "null view, large draw: success");
++        expect(p.index_buffer == scratch_buffer && p.index_stage.copy_bytes == 0 && p.index_stage.fill_bytes >= 200,
++               "null view, large draw: a zeroed scratch covers the whole draw");
++    }
++
++    if (failures) {
++        std::fprintf(stderr, "replay_index_view_test: FAILED (%d failures)\n", failures);
++        return 1;
++    }
++    std::printf("replay_index_view_test: all passed\n");
++    return 0;
++}
