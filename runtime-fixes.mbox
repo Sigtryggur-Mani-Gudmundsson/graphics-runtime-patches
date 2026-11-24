@@ -1,7 +1,8 @@
 From 0fa0a0c49d0a501bc1ab3c273f7b5a8f52c885be Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:35:52 +0000
-Subject: [PATCH 1/9] test: run the translated draw guest through CTest on Wine
+Subject: [PATCH 01/10] test: run the translated draw guest through CTest on
+ Wine
 
 
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
@@ -83,7 +84,8 @@ index b6584e3784407b00c7a9a266004796dfea3b2659..bbee1851169a04e38402998965a62bbe
 From a8b1419fec6dbe0c634773cbf2407df1bec1189c Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:35:52 +0000
-Subject: [PATCH 2/9] fix: skip presentation for a measured zero client extent
+Subject: [PATCH 02/10] fix: skip presentation for a measured zero client
+ extent
 
 
 diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
@@ -197,7 +199,7 @@ index a54bf6662ce6ff096ac3a6977f7a7a887bbfc86b..b3db4927cd24b5ef6ee952116fd65932
 From cc5e050eca34568e4c44c98fb72fdb53e54c6d1f Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:37:30 +0000
-Subject: [PATCH 3/9] fix: restore verified EXEC, mesh and image-load
+Subject: [PATCH 03/10] fix: restore verified EXEC, mesh and image-load
  translations
 
 Backported from simomistralii/Leonida-PC PR 2, original commits by Claude: 65d5201fd3927551574af221022fc6ec64a783c1, ad0fb49cbbae399a2305a19566c1959d4bcba4e5 and 14e2312774700a09b5746d1f479170c531f74842.
@@ -472,7 +474,7 @@ index 74d37961f6529f253eab6aa8741b235d95ca40ed..79ef42ea12419c237fd28430218dcd1c
 From 7b8b4bea60cfae50564b82716febae20c1e9f38f Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:31 +0000
-Subject: [PATCH 4/9] fix: restore hardware audio context sizes
+Subject: [PATCH 04/10] fix: restore hardware audio context sizes
 
 Source: luizwidmer/Leonida-work at 7d61424381ea69e7422cd98e13ee2b682a58d055. Includes the original padding changes and comments.
 
@@ -504,7 +506,7 @@ index 553f57f2072a619a8b7e7f0deeeb0ad3fd4f6b32..02dc650575e3c73c580ca75faac86762
 From 28cd1ce7d2797dc1d8865fd7961f590af790eddf Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:31 +0000
-Subject: [PATCH 5/9] fix: route addressed descriptor heaps through their
+Subject: [PATCH 05/10] fix: route addressed descriptor heaps through their
  device
 
 Builds on the slot 14 routing and test in Vyzerythe/Leonida PR 12. The per-device callback and COM ownership checks are local changes.
@@ -783,7 +785,7 @@ index 5f694b5a2a22fced351ecfac89701435023d14ba..d588cbff8f0366829158cf10cd75ecb1
 From 21e0f27001be96e6953c35a13d3cc595e5002a42 Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:31 +0000
-Subject: [PATCH 6/9] test: restore image atomic guard coverage for nested
+Subject: [PATCH 06/10] test: restore image atomic guard coverage for nested
  regions
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -985,7 +987,8 @@ index c769038bbf9e334b889e47489ca8f4ecf7cd488c..5ed1cf121ee343be01adcf5223347969
 From 02b5c8b3e4e946c7f77ed3b3e6cd55c8d670544f Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:39:55 +0000
-Subject: [PATCH 7/9] test: check true edges when verifying image atomic guards
+Subject: [PATCH 07/10] test: check true edges when verifying image atomic
+ guards
 
 
 diff --git a/tests/semantic/test_image_atomics_guard.py b/tests/semantic/test_image_atomics_guard.py
@@ -1105,7 +1108,7 @@ index 5ed1cf121ee343be01adcf52233479699a9fd133..b5c117c89f4351f32ca0fd2ba057e046
 From 0d1ba0fe9819aff48d3d6105e23dcc1557826d9b Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:47:13 +0000
-Subject: [PATCH 8/9] fix: expose readback only for accepted swapchain images
+Subject: [PATCH 08/10] fix: expose readback only for accepted swapchain images
 
 
 diff --git a/runtime/src/vulkan_present.h b/runtime/src/vulkan_present.h
@@ -1197,7 +1200,7 @@ index b3db4927cd24b5ef6ee952116fd65932600d6359..5abe0d41b6434ccd29bc3e4c8cb4599c
 From 710b8f900fe7c6c89cb55298ca4a1b58e96ad6bd Mon Sep 17 00:00:00 2001
 From: Codex <codex@localhost>
 Date: Tue, 24 Nov 2026 01:48:15 +0000
-Subject: [PATCH 9/9] feat: report exact nonzero RGB pixel count in frame
+Subject: [PATCH 09/10] feat: report exact nonzero RGB pixel count in frame
  captures
 
 
@@ -1285,3 +1288,374 @@ index 5c626ea80b47f1acf3e489b723e70793fc88f5b1..43f164c591dd0e787899750127f93d65
                      std::fabs(r - (red ? 255 : 51)) <= 3.0 && std::fabs(g - (red ? 0 : 153)) <= 3.0 &&
                      std::fabs(b - (red ? 0 : 230)) <= 3.0) ++matching;
              }
+
+From bad701ff8ee000f11c7859d782e55a219701bcd7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 01:59:34 +0000
+Subject: [PATCH 10/10] fix: resolve ray-tracing instance pointers through
+ their backing buffers
+
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index eb308b9af9355d0dfb21eb08859917eaba115d7d..2e8eed7018859e3873445db82e038df0caa309bf 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -1563,6 +1563,12 @@ if(TARGET Vulkan::Headers)
+   endif()
+   if(BUILD_TESTING)
+     add_test(NAME vk_buffer_registration_oom COMMAND vk_buffer_registration_oom_test)
++    add_executable(vk_khr_instance_addresses_test test/vk_khr_instance_addresses_test.cpp)
++    target_link_libraries(vk_khr_instance_addresses_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
++    if(WIN32)
++      target_compile_definitions(vk_khr_instance_addresses_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
++    endif()
++    add_test(NAME vk_khr_instance_addresses COMMAND vk_khr_instance_addresses_test)
+   endif()
+   # CPU-only: ScratchBuffers chunk alignment, retire/collect/forget, and spare cap (runtime/src/vulkan_scratch.h).
+   add_executable(vulkan_scratch_test test/vulkan_scratch_test.cpp)
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index fabec62559d807798e5dcfcf792cd384d888c759..81165c1d29dbf8858c8d8ac66609515269470332 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -686,6 +686,7 @@ struct DeviceState {
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+         if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
++        if (info.ray_tracing) result.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+         // D3D12 reserved buffers are visible to DIRECT, COPY and COMPUTE queues without exposing Vulkan
+         // queue-family ownership. Their tile bindings and accesses may use distinct families, so match the
+         // CONCURRENT sharing policy used for ordinary buffers and the GPU address arena.
+@@ -2014,7 +2015,8 @@ public:
+             at = region_end - base;
+         }
+         if (!importable) return E_NOTIMPL;
+-        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
++        const bool need_bda = device_.info.buffer_device_address || device_.info.ray_tracing ||
++                              device_.arena.buffer != VK_NULL_HANDLE;
+         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+@@ -2025,6 +2027,7 @@ public:
+                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+         if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++        if (device_.info.ray_tracing) info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+         device_.share(info);
+         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+         VkMemoryRequirements requirements{};
+diff --git a/runtime/src/vulkan_backend.h b/runtime/src/vulkan_backend.h
+index e3e4defe8990c526dde6a02c93bf957f5550b604..b85e0e1e7be1c5f5babd1e8211f7bb27eaf4392b 100644
+--- a/runtime/src/vulkan_backend.h
++++ b/runtime/src/vulkan_backend.h
+@@ -1000,12 +1000,12 @@ public:
+         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
+         replay_.host_at = [this](std::uint64_t va, std::uint64_t bytes, const std::uint8_t*& host) {
+             BufferVaIndex<ResourceId>::Hit hit{};
+-            if (!buffer_vas_.find(va, hit)) return HostReadStatus::absent;
++            if (!buffer_vas_.find(va, hit, bytes)) return HostReadStatus::absent;
+             const ResourceBinding* b = resolve(hit.id);
+             if (!b) return HostReadStatus::absent;
+-            if (!b->host) return HostReadStatus::not_cpu_written;
+             const std::uint64_t offset = va - b->va;
+             if (offset > b->size || bytes > b->size - offset) return HostReadStatus::absent;
++            if (!b->host) return HostReadStatus::not_cpu_written;
+             host = b->host + offset;
+             return HostReadStatus::ok;
+         };
+@@ -2217,22 +2217,33 @@ private:
+             discard();
+             return ReplayResult::unsupported;
+         }
+-        // Validate and translate in one pass straight into the staging buffer; no second vector of addresses.
++        // A title-placed buffer's console VA can be unrelated to its Vulkan device address.
++        // Look up the backing buffer, reusing its base across adjacent entries in the same buffer.
++        VkBuffer previous_buffer = VK_NULL_HANDLE;
++        VkDeviceAddress buffer_base = 0;
+         for (std::uint32_t i = 0; i < build.instance_count; ++i) {
+             std::uint64_t va = 0;
+             std::memcpy(&va, guest + 8ull * i, sizeof(va));
+             VkBuffer buffer = VK_NULL_HANDLE;
+             VkDeviceSize offset = 0;
+             std::uint64_t room = 64;  // one D3D12_RAYTRACING_INSTANCE_DESC
+-            // No overflow check on heap_base + va: a buffer outside the arena whose device address lies below the
+-            // arena's (an UPLOAD heap in system memory without Resizable BAR) has a VA that wraps (address - base),
+-            // and the unsigned sum wraps back to its device address, as the replay's other VA translations do.
+             if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64) {
+                 funcs.vkUnmapMemory(context_.device(), stage.memory);
+                 discard();
+                 return ReplayResult::invalid_copy;
+             }
+-            const std::uint64_t device_address = vk.heap_base + va;
++            if (buffer != previous_buffer) {
++                VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++                info.buffer = buffer;
++                buffer_base = funcs.vkGetBufferDeviceAddress(context_.device(), &info);
++                previous_buffer = buffer;
++            }
++            if (!buffer_base || offset > UINT64_MAX - buffer_base) {
++                funcs.vkUnmapMemory(context_.device(), stage.memory);
++                discard();
++                return ReplayResult::invalid_copy;
++            }
++            const std::uint64_t device_address = buffer_base + offset;
+             std::memcpy(static_cast<std::uint8_t*>(mapped) + 8ull * i, &device_address, sizeof(device_address));
+         }
+         funcs.vkUnmapMemory(context_.device(), stage.memory);
+diff --git a/runtime/test/vk_buffer_registration_oom_test.cpp b/runtime/test/vk_buffer_registration_oom_test.cpp
+index 69302b2a57ae1085daddefc96ecba11b9ff51344..a98f7f5e2e3ed1808fc7ccfcf8b9026b63804e93 100644
+--- a/runtime/test/vk_buffer_registration_oom_test.cpp
++++ b/runtime/test/vk_buffer_registration_oom_test.cpp
+@@ -1,6 +1,6 @@
+ // Buffer registration keeps bindings, VA lookups, and sparse ownership in step when host allocation fails.
+ // Public runtime classes with fake Vulkan procedures: no loader, GPU, or game data.
+-#include "../src/vulkan_backend.h"
++#include "vk_test_queue_stub.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -21,55 +21,16 @@ void expect(bool ok, const char* what) {
+     if (!ok) { std::fprintf(stderr, "FAIL: %s\n", what); ++failures; }
+ }
+ 
+-template<typename Handle> Handle handle(std::uintptr_t value) {
+-    if constexpr (std::is_pointer_v<Handle>) return reinterpret_cast<Handle>(value);
+-    else return static_cast<Handle>(value);
+-}
+-
+-leonida::ResourceBinding buffer(std::uintptr_t value, std::uint64_t va, std::uint64_t size = 64) {
+-    leonida::ResourceBinding b{};
+-    b.buffer = handle<VkBuffer>(value);
+-    b.va = va;
+-    b.size = size;
+-    return b;
+-}
++using vk_queue_stub::buffer;
++using vk_queue_stub::handle;
+ 
+-VkResult VKAPI_CALL create_pool(VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*, VkCommandPool* out) {
+-    *out = handle<VkCommandPool>(1); return VK_SUCCESS;
+-}
+-void VKAPI_CALL destroy_pool(VkDevice, VkCommandPool, const VkAllocationCallbacks*) {}
+-VkResult VKAPI_CALL create_semaphore(VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*, VkSemaphore* out) {
+-    *out = handle<VkSemaphore>(1); return VK_SUCCESS;
+-}
+-void VKAPI_CALL destroy_semaphore(VkDevice, VkSemaphore, const VkAllocationCallbacks*) {}
+ void VKAPI_CALL destroy_buffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) { ++destroyed_sparse_buffers; }
+-VkResult VKAPI_CALL counter(VkDevice, VkSemaphore, std::uint64_t* out) { *out = UINT64_MAX; return VK_SUCCESS; }
+-VkResult VKAPI_CALL idle(VkQueue) { return VK_SUCCESS; }
+-VkResult VKAPI_CALL allocate_commands(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* out) {
+-    *out = handle<VkCommandBuffer>(1); return VK_SUCCESS;
+-}
+-VkResult VKAPI_CALL reset_command(VkCommandBuffer, VkCommandBufferResetFlags) { return VK_SUCCESS; }
+-VkResult VKAPI_CALL begin_command(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
+-VkResult VKAPI_CALL end_command(VkCommandBuffer) { return VK_SUCCESS; }
+-VkResult VKAPI_CALL submit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; }
+-void VKAPI_CALL record_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+-                               std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
+-                               std::uint32_t, const VkImageMemoryBarrier*) {}
+-void VKAPI_CALL record_update(VkCommandBuffer, VkBuffer buffer, VkDeviceSize, VkDeviceSize, const void*) {
+-    updated_buffer = buffer;
++void VKAPI_CALL record_update(VkCommandBuffer, VkBuffer b, VkDeviceSize, VkDeviceSize, const void*) {
++    updated_buffer = b;
+ }
+-PFN_vkVoidFunction VKAPI_CALL queue_proc(VkDevice, const char* name) {
+-#define PROC(vk_name, implementation) \
+-    if (std::strcmp(name, #vk_name) == 0) return reinterpret_cast<PFN_vkVoidFunction>(implementation)
+-    PROC(vkCreateCommandPool, create_pool); PROC(vkDestroyCommandPool, destroy_pool);
+-    PROC(vkCreateSemaphore, create_semaphore); PROC(vkDestroySemaphore, destroy_semaphore);
+-    PROC(vkGetSemaphoreCounterValue, counter); PROC(vkQueueWaitIdle, idle);
+-    PROC(vkAllocateCommandBuffers, allocate_commands); PROC(vkResetCommandBuffer, reset_command);
+-    PROC(vkBeginCommandBuffer, begin_command); PROC(vkEndCommandBuffer, end_command);
+-    PROC(vkQueueSubmit, submit); PROC(vkCmdPipelineBarrier, record_barrier);
+-    PROC(vkCmdUpdateBuffer, record_update);
+-#undef PROC
+-    return nullptr;
++PFN_vkVoidFunction VKAPI_CALL queue_proc(VkDevice device, const char* name) {
++    if (std::strcmp(name, "vkCmdUpdateBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(record_update);
++    return vk_queue_stub::queue_proc(device, name);
+ }
+ 
+ struct Observation { leonida::ReplayResult result; VkBuffer buffer; };
+diff --git a/runtime/test/vk_khr_instance_addresses_test.cpp b/runtime/test/vk_khr_instance_addresses_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..66d4a680e3ff640ad3d5dbfdeed0ef4e225fdec4
+--- /dev/null
++++ b/runtime/test/vk_khr_instance_addresses_test.cpp
+@@ -0,0 +1,116 @@
++// Stage a TLAS pointer list through the real queue. Synthetic buffer addresses let this test
++// inspect the staged entries without submitting ray-tracing work or requiring a GPU.
++#include "vk_test_queue_stub.h"
++
++#include <array>
++#include <cstdio>
++
++namespace {
++using vk_queue_stub::handle;
++using vk_queue_stub::buffer;
++std::array<std::uint64_t, 2> staged{};
++unsigned builds = 0;
++constexpr VkDeviceAddress stage_base = 0x220000;
++constexpr VkDeviceAddress arena_base = 0x300000;
++constexpr VkDeviceAddress imported_base = 0x340000;
++
++VkResult VKAPI_CALL create_buffer(VkDevice, const VkBufferCreateInfo* info, const VkAllocationCallbacks*, VkBuffer* out) {
++    if (info->size > sizeof(staged)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++    *out = handle<VkBuffer>(77);
++    return VK_SUCCESS;
++}
++void VKAPI_CALL destroy_buffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {}
++void VKAPI_CALL requirements(VkDevice, VkBuffer, VkMemoryRequirements* out) { *out = {sizeof(staged), 8, 1}; }
++VkResult VKAPI_CALL allocate_memory(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory* out) {
++    *out = handle<VkDeviceMemory>(55);
++    return VK_SUCCESS;
++}
++void VKAPI_CALL free_memory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
++VkResult VKAPI_CALL bind_memory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) { return VK_SUCCESS; }
++VkResult VKAPI_CALL map_memory(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void** out) {
++    *out = staged.data();
++    return VK_SUCCESS;
++}
++void VKAPI_CALL unmap_memory(VkDevice, VkDeviceMemory) {}
++VkDeviceAddress VKAPI_CALL device_address(VkDevice, const VkBufferDeviceAddressInfo* info) {
++    if (info->buffer == handle<VkBuffer>(77)) return stage_base;
++    if (info->buffer == handle<VkBuffer>(123)) return imported_base;
++    if (info->buffer == handle<VkBuffer>(124)) return arena_base;
++    return 0;
++}
++void VKAPI_CALL build_instances(VkCommandBuffer, std::uint32_t count, const VkAccelerationStructureBuildGeometryInfoKHR* info,
++                                const VkAccelerationStructureBuildRangeInfoKHR* const*) {
++    if (count == 1 && info->geometryCount == 1 && info->pGeometries[0].geometry.instances.arrayOfPointers &&
++        info->pGeometries[0].geometry.instances.data.deviceAddress == stage_base) ++builds;
++}
++PFN_vkVoidFunction VKAPI_CALL ray_proc(VkDevice d, const char* name) {
++#define PROC(api, fn) if (std::strcmp(name, #api) == 0) return reinterpret_cast<PFN_vkVoidFunction>(fn)
++    PROC(vkCreateBuffer, create_buffer);
++    PROC(vkDestroyBuffer, destroy_buffer);
++    PROC(vkGetBufferMemoryRequirements, requirements);
++    PROC(vkAllocateMemory, allocate_memory);
++    PROC(vkFreeMemory, free_memory);
++    PROC(vkBindBufferMemory, bind_memory);
++    PROC(vkMapMemory, map_memory);
++    PROC(vkUnmapMemory, unmap_memory);
++    PROC(vkGetBufferDeviceAddress, device_address);
++    PROC(vkCmdBuildAccelerationStructuresKHR, build_instances);
++#undef PROC
++    return vk_queue_stub::queue_proc(d, name);
++}
++}  // namespace
++
++#define EXPECT(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
++
++int main() {
++    using namespace leonida;
++    VulkanContext ctx(ray_proc, handle<VkDevice>(1), false, false, true);
++    ctx.set_heap_base(arena_base);
++    VkPhysicalDeviceMemoryProperties memory{};
++    memory.memoryTypeCount = 1;
++    memory.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    ctx.set_occlusion_resolve_memory(memory);
++    ctx.register_acceleration_structure(0x9000, handle<VkAccelerationStructureKHR>(1));
++
++    const std::array<std::uint64_t, 4> guest{0, 0, 0x110010, 0x8080};
++    auto list = buffer(111, 0x1000, sizeof(guest));
++    list.host = reinterpret_cast<const std::uint8_t*>(guest.data());
++    ctx.add_resource(1, list);
++    auto imported = buffer(123, 0x110000, 256);
++    ctx.add_resource(2, imported);
++    auto arena = buffer(124, 0x8000, 256);
++    arena.buffer_offset = arena.va;
++    ctx.add_resource(3, arena);
++
++    VulkanQueue queue(ctx, handle<VkQueue>(1), 0);
++    EXPECT(queue.ok());
++    CommandList commands;
++    BuildAccelerationStructure build{};
++    build.is_tlas = true;
++    build.dst_va = 0x9000;
++    build.scratch_va = 0xa000;
++    build.instance_pointers = true;
++    build.instance_count = 2;
++    build.instances_va = list.va + 16;
++    EXPECT(commands.build_acceleration_structure(build) && commands.close());
++    const CommandList* batch[] = {&commands};
++    const std::array<std::uint64_t, 2> expected{imported_base + 16, arena_base + 0x8080};
++    EXPECT(queue.execute(batch) == ReplayResult::success && builds == 1 && staged == expected);
++
++    // The closer alias ends after the first pointer. The containing CPU mapping supplies both entries.
++    auto alias = buffer(111, build.instances_va, 8);
++    alias.host = list.host + 16;
++    ctx.add_resource(4, alias);
++    EXPECT(queue.execute(batch) == ReplayResult::success && builds == 2 && staged == expected);
++    imported.buffer = handle<VkBuffer>(125);  // the driver returns no device address
++    ctx.add_resource(2, imported);
++    EXPECT(queue.execute(batch) == ReplayResult::invalid_copy && builds == 2);
++    imported.buffer = handle<VkBuffer>(123);
++    ctx.add_resource(2, imported);
++    ctx.remove_resource(1);
++    EXPECT(queue.execute(batch) == ReplayResult::invalid_copy && builds == 2);
++    list.host = nullptr;
++    ctx.add_resource(1, list);
++    EXPECT(queue.execute(batch) == ReplayResult::unsupported && builds == 2);
++    return 0;
++}
+diff --git a/runtime/test/vk_test_queue_stub.h b/runtime/test/vk_test_queue_stub.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..30de7b57f198472de018c142fd0815d2e93abc2d
+--- /dev/null
++++ b/runtime/test/vk_test_queue_stub.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++// Minimal queue procedures shared by CPU-only VulkanContext replay tests.
++#include "../src/vulkan_backend.h"
++
++#include <cstring>
++#include <type_traits>
++
++namespace vk_queue_stub {
++template<typename Handle> Handle handle(std::uintptr_t value) {
++    if constexpr (std::is_pointer_v<Handle>) return reinterpret_cast<Handle>(value);
++    else return static_cast<Handle>(value);
++}
++
++inline leonida::ResourceBinding buffer(std::uintptr_t value, std::uint64_t va, std::uint64_t size = 64) {
++    leonida::ResourceBinding b{};
++    b.buffer = handle<VkBuffer>(value);
++    b.va = va;
++    b.size = size;
++    return b;
++}
++
++inline VkResult VKAPI_CALL create_pool(VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*, VkCommandPool* out) {
++    *out = handle<VkCommandPool>(1); return VK_SUCCESS;
++}
++inline void VKAPI_CALL destroy_pool(VkDevice, VkCommandPool, const VkAllocationCallbacks*) {}
++inline VkResult VKAPI_CALL create_semaphore(VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*, VkSemaphore* out) {
++    *out = handle<VkSemaphore>(1); return VK_SUCCESS;
++}
++inline void VKAPI_CALL destroy_semaphore(VkDevice, VkSemaphore, const VkAllocationCallbacks*) {}
++inline VkResult VKAPI_CALL counter(VkDevice, VkSemaphore, std::uint64_t* out) { *out = UINT64_MAX; return VK_SUCCESS; }
++inline VkResult VKAPI_CALL idle(VkQueue) { return VK_SUCCESS; }
++inline VkResult VKAPI_CALL allocate_commands(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* out) {
++    *out = handle<VkCommandBuffer>(1); return VK_SUCCESS;
++}
++inline VkResult VKAPI_CALL reset_command(VkCommandBuffer, VkCommandBufferResetFlags) { return VK_SUCCESS; }
++inline VkResult VKAPI_CALL begin_command(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
++inline VkResult VKAPI_CALL end_command(VkCommandBuffer) { return VK_SUCCESS; }
++inline VkResult VKAPI_CALL submit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; }
++inline void VKAPI_CALL record_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
++                               std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
++                               std::uint32_t, const VkImageMemoryBarrier*) {}
++inline PFN_vkVoidFunction VKAPI_CALL queue_proc(VkDevice, const char* name) {
++#define PROC(vk_name, implementation) \
++    if (std::strcmp(name, #vk_name) == 0) return reinterpret_cast<PFN_vkVoidFunction>(implementation)
++    PROC(vkCreateCommandPool, create_pool); PROC(vkDestroyCommandPool, destroy_pool);
++    PROC(vkCreateSemaphore, create_semaphore); PROC(vkDestroySemaphore, destroy_semaphore);
++    PROC(vkGetSemaphoreCounterValue, counter); PROC(vkQueueWaitIdle, idle);
++    PROC(vkAllocateCommandBuffers, allocate_commands); PROC(vkResetCommandBuffer, reset_command);
++    PROC(vkBeginCommandBuffer, begin_command); PROC(vkEndCommandBuffer, end_command);
++    PROC(vkQueueSubmit, submit); PROC(vkCmdPipelineBarrier, record_barrier);
++#undef PROC
++    return nullptr;
++}
++}  // namespace vk_queue_stub

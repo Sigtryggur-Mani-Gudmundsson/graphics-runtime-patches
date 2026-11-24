@@ -1,6 +1,6 @@
 # Graphics runtime patches
 
-Nine source and test commits for the Leonida compatibility runtime, based on `de4c37383cad386eaa851047628d7b92c51009c5`. The series includes Wine test registration, Vulkan presentation and capture fixes, shader translation fixes, audio structure sizes, descriptor heap routing and regression tests. All GPU and audio results below use synthetic fixtures. Retail startup is unverified.
+Ten source and test commits for the Leonida compatibility runtime, based on `de4c37383cad386eaa851047628d7b92c51009c5`. The series includes Wine test registration, Vulkan presentation and capture fixes, shader translation fixes, audio structure sizes, descriptor heap routing and regression tests. All GPU and audio results below use synthetic fixtures. Retail startup is unverified.
 
 ## Apply the series
 
@@ -12,11 +12,11 @@ git am /path/to/runtime-fixes.mbox
 git rev-parse 'HEAD^{tree}'
 ```
 
-The verified source tree is `42d7053bc0bfe2746d25e0aa8e4f9f646fd5b814`. Applying the published series to the base reproduced this tree.
+The verified source tree is `039706d73610f47bb0cd7f2b387395f2df856533`. Applying the published series to the base reproduced this tree.
 
 ## Verification
 
-The first seven commits were tested together in the suites below. The two follow-up commits were tested in the source-built Windows presenter on Wine/XWayland. An injected out-of-date present invalidated readback, a suboptimal present retained it, and the captured pixel counts matched all three synthetic images.
+The first seven commits were tested together in the suites below. The two presenter follow-up commits were tested in the source-built Windows presenter on Wine/XWayland. An injected out-of-date present invalidated readback, a suboptimal present retained it, and the captured pixel counts matched all three synthetic images.
 
 | Suite | Result |
 | --- | --- |
@@ -26,6 +26,8 @@ The first seven commits were tested together in the suites below. The two follow
 | Windows audio ABI under Wine | 65 checks, zero failures |
 
 The Windows drawing guest and presenter measurements are in [windows-guest-frame-results.txt](windows-guest-frame-results.txt). Before-and-after shader measurements, including the emulated wave64 run, are in [RTX4070Ti-shader-results.txt](RTX4070Ti-shader-results.txt). The complete Windows runtime build is unverified.
+
+The tenth commit fixes the optional KHR ray-tracing path. A short overlapping buffer could hide the CPU mapping for an instance pointer list. The queue also used the global arena base when translating descriptors in imported buffers. The new queue regression checks the staged Vulkan addresses, a short alias, an incomplete range, an unreadable list and a missing device address. It passed on Linux and as a Windows executable under Wine using a Vulkan test double. The final Linux CTest run passed 69 tests and skipped the same two listed above. A hardware KHR build with imported instances and the Windows D3D12 shim changes remain unverified.
 
 ## Source and attribution
 
