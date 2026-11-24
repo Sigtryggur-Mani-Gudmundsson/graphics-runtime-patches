@@ -6,6 +6,8 @@ Ten source and test commits for the Leonida compatibility runtime, based on `de4
 
 On the frame-loop branch, the GPU missed updates to descriptors in a rebound table. The two commits in [descriptor-table-refresh.mbox](descriptor-table-refresh.mbox) connect the Xbox heap backing to the submission-time scan, retain the largest declared range at each address, and route the scan through the submitting device. On an RTX 4070 Ti under Wine, reusing the same closed list produced the expected new 64-word pattern on both submissions. This also passed with a second compatibility device alive. [Controls, reproduction and combined patch order](tests/descriptor-table-refresh/README.md)
 
+When the game copies an API-written descriptor with the CPU, the Vulkan heap can be correct while the game's copy still contains zeros. Applying [descriptor-write-through.mbox](descriptor-write-through.mbox) after the two refresh commits fixed the CPU copy under Wine. Two consecutive GPU submissions went from 0/64 expected words each to 64/64 each. [Write-through results and reproduction](tests/descriptor-write-through/README.md)
+
 ## Optional graphics layout on the frame-loop branch
 
 Apply [graphics-root-layout.mbox](graphics-root-layout.mbox) to Mumogg's frame-loop branch at `e0d4fd2b81e6636b1c6bb2f76be79e910e84d84b`. The fix accepts descriptor tables that fit the selected graphics layout and preserves both address words when a signature falls back to the default layout. A synthetic 17-table draw failed before submission on the original branch. With the fix, three draws produced the expected values across all 4,096 pixels on an RTX 4070 Ti under Wine. [Regression cases and pixel reproduction](tests/graphics-root-layout/README.md)
