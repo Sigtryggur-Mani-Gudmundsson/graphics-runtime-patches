@@ -2,6 +2,10 @@
 
 Ten source and test commits for the Leonida compatibility runtime, based on `de4c37383cad386eaa851047628d7b92c51009c5`. The series includes Wine test registration, Vulkan presentation and capture fixes, shader translation fixes, audio structure sizes, descriptor heap routing and regression tests. All GPU and audio results below use synthetic fixtures. Retail startup is unverified.
 
+## Command-list creation on current main
+
+The [standalone slot-73 patch](command-list-interface.mbox) lets an Xbox command-list request that the PC backend rejects reach a Vulkan queue while preserving refusal of unsupported public list revisions. The synthetic private-interface case created, closed, submitted and fenced a list on an RTX 4070 Ti under Wine. [GPU comparison, PR 359 review patch and reproduction](tests/command-list-interface/README.md)
+
 ## Refreshing title-backed descriptor tables
 
 On the frame-loop branch, the GPU missed updates to descriptors in a rebound table. The two commits in [descriptor-table-refresh.mbox](descriptor-table-refresh.mbox) connect the Xbox heap backing to the submission-time scan, retain the largest declared range at each address, and route the scan through the submitting device. On an RTX 4070 Ti under Wine, reusing the same closed list produced the expected new 64-word pattern on both submissions. This also passed with a second compatibility device alive. [Controls, reproduction and combined patch order](tests/descriptor-table-refresh/README.md)

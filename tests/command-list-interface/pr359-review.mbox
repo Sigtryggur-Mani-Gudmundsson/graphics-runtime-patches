@@ -1,0 +1,71 @@
+From 44acb5539e3c6f567d48d3cf3cd07aeca03b559b Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 05:30:42 +0000
+Subject: [PATCH] d3d12_xs: preserve PC list revision failures on the console
+ factory fallback
+
+---
+ runtime/shims/d3d12_xs_device.cpp   | 14 +++++++++++++-
+ runtime/test/xs_proxy_mock_test.cpp | 14 ++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index b7085a2..20bcc5a 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1411,6 +1411,18 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
+     return S_OK;
+ }
+ 
++// A failure to create a public PC list revision means the backend does not implement it. Retrying
++// with the base IID would report success while returning an object without the requested interface.
++bool is_public_list_request(REFIID iid) {
++#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
++    if (IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList9))) return true;
++#endif
++#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
++    if (IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList10))) return true;
++#endif
++    return is_list_iid(iid);
++}
++
+ // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
+ // not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
+ // (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established.
+@@ -1442,7 +1454,7 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word,
+     void* created = nullptr;
+     const IID pc_list_iid = __uuidof(ID3D12GraphicsCommandList);
+     HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
+-    if (hr == E_NOINTERFACE) {
++    if (hr == E_NOINTERFACE && !is_public_list_request(*riid)) {
+         // Console command-list IIDs are not exposed by PC/Vulkan devices (docs/retail_boot_chain.md §3.3); fall back
+         // to the base PC graphics command list and wrap it in the console list proxy.
+         static std::atomic<bool> iid_fallback_logged{false};
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index fd280ad..7d5f6da 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -1310,6 +1310,20 @@ int check_boot_stops_7_9() {
+     EXPECT(xs::is_command_list_proxy(list_proxy));
+     EXPECT(mock->calls[12] == 2);  // first attempt returned E_NOINTERFACE, fallback succeeded with ID3D12GraphicsCommandList
+     EXPECT(release(list_proxy) == 0);
++    // The mock exposes the base PC list only. Preserve a real PC capability refusal even on slot 73.
++    auto check_unsupported = [&](REFIID iid) {
++        const auto calls = mock->calls[12];
++        void* out = device;  // failure must clear the output
++        return hr_of(raw(device, 73, word(&list_desc), word(allocator), 0, word(&iid), word(&out))) ==
++                   E_NOINTERFACE && !out && mock->calls[12] == calls + 1;
++    };
++    EXPECT(check_unsupported(__uuidof(ID3D12GraphicsCommandList7)));
++#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
++    EXPECT(check_unsupported(__uuidof(ID3D12GraphicsCommandList9)));
++#endif
++#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
++    EXPECT(check_unsupported(__uuidof(ID3D12GraphicsCommandList10)));
++#endif
+     EXPECT(release(allocator) == 0);
+     EXPECT(release(device) == 0 && mock->refs == 0);
+ 
+-- 
+2.56.1
+

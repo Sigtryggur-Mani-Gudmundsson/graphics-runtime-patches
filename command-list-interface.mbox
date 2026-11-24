@@ -1,0 +1,92 @@
+From c204836f5aa522886432156c25f7502c3d7979f8 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 05:30:42 +0000
+Subject: [PATCH] d3d12_xs: retry a console list request without masking public
+ list revisions
+
+Extract the slot 73 E_NOINTERFACE fallback from andretuta's #359 onto current main, preserving typed PC failures. A synthetic caller can close, submit and fence the list through the Vulkan backend. Exercise the refusal and error paths without embedding a retail IID.
+---
+ runtime/shims/d3d12_xs_device.cpp   | 22 ++++++++++++++++++++--
+ runtime/test/xs_proxy_mock_test.cpp | 26 ++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 7f7040f..e8c214b 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1413,6 +1413,18 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
+     return S_OK;
+ }
+ 
++// A failure to create a public PC list revision means the backend does not implement it. Retrying
++// with the base IID would report success while returning an object without the requested interface.
++bool is_public_list_request(REFIID iid) {
++#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
++    if (IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList9))) return true;
++#endif
++#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
++    if (IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList10))) return true;
++#endif
++    return is_list_iid(iid);
++}
++
+ // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
+ // not the PC six-argument form: the type is the first word of D3D12XBOX_COMMAND_LIST_DESC and there is no node mask
+ // (the HLE passes 0). The second desc word is logged, not interpreted: its public layout is not established.
+@@ -1442,8 +1454,14 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word,
+     if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
+     auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
+     void* created = nullptr;
+-    const HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state,
+-                                                     *riid, &created);
++    HRESULT hr = self->real->CreateCommandList(0, type, allocator, initial_state, *riid, &created);
++    // The console factory can request a list IID the PC backend does not recognize. Only this creation
++    // route retries. A supported public revision goes straight through and a refused public revision stays refused.
++    const IID& base = __uuidof(ID3D12GraphicsCommandList);
++    if (hr == E_NOINTERFACE && !is_public_list_request(*riid)) {
++        hr = self->real->CreateCommandList(0, type, allocator, initial_state, base, &created);
++        riid = &base;
++    }
+     if (FAILED(hr)) return hr;
+     return wrap_list(static_cast<IUnknown*>(created), self, riid, out);
+ }
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index 2240302..79d8634 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -959,6 +959,32 @@ int check_xbox_slots() {
+     // output on failure, so an invalid call would clear this pointer.
+     EXPECT(release(list) == 0);
+ 
++    // The console factory falls back on a synthetic private IID while preserving backend errors and
++    // the capability result for public list versions. The mock exposes the base graphics list only.
++    const IID private_iid{0x75aada94, 0x501f, 0x435b, {0xa9, 0xc2, 0x4e, 0x15, 0x18, 0x67, 0xe2, 0x64}};
++    auto create = [&](REFIID iid) {
++        return hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&iid), word(&list)));
++    };
++    unsigned calls = mock->calls[12];
++    EXPECT(create(private_iid) == S_OK && xs::is_command_list_proxy(list) && mock->calls[12] == calls + 2);
++    EXPECT(release(list) == 0 && mock->last_child->refs == 0);
++    auto check_unsupported = [&](REFIID iid) {
++        const auto before = mock->calls[12];
++        list = device;
++        return create(iid) == E_NOINTERFACE && !list && mock->calls[12] == before + 1;
++    };
++    EXPECT(check_unsupported(__uuidof(ID3D12GraphicsCommandList7)));
++#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
++    EXPECT(check_unsupported(__uuidof(ID3D12GraphicsCommandList9)));
++#endif
++#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
++    EXPECT(check_unsupported(__uuidof(ID3D12GraphicsCommandList10)));
++#endif
++    mock->create_result = E_OUTOFMEMORY;
++    calls = mock->calls[12];
++    EXPECT(create(private_iid) == E_OUTOFMEMORY && !list && mock->calls[12] == calls + 1);
++    mock->create_result = S_OK;
++
+     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
+     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
+     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);
+-- 
+2.56.1
+
