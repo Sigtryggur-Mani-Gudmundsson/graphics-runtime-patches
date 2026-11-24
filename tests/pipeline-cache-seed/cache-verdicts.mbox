@@ -1,0 +1,87 @@
+From 5f1dc1ee3a7243bd55a527673753206df06d94be Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 16:45:04 +0000
+Subject: [PATCH] tests: preserve pipeline-cache checker and control failures
+
+---
+ runtime/CMakeLists.txt                       |  2 +-
+ runtime/test/check_pipeline_cache_seed.cmake | 23 +++++++++++++-------
+ runtime/test/pipeline_cache_seed_test.cpp    |  7 ++++--
+ 3 files changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index a094719f..7f42b3b6 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -2256,7 +2256,7 @@ if(TARGET Vulkan::Headers)
+                "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_seed"
+                "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pipeline_cache_seed.cmake")
+-      set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP: ")
++      set_tests_properties(pipeline_cache_seed PROPERTIES SKIP_REGULAR_EXPRESSION "(^|\n)-- pipeline_cache_seed skipped: ")
+     endif()
+ 
+     # What Close returns after one recorded call, against WARP; today's differences are listed in the test.
+diff --git a/runtime/test/check_pipeline_cache_seed.cmake b/runtime/test/check_pipeline_cache_seed.cmake
+index 89a3c2ab..d760afcb 100644
+--- a/runtime/test/check_pipeline_cache_seed.cmake
++++ b/runtime/test/check_pipeline_cache_seed.cmake
+@@ -14,20 +14,27 @@ file(COPY_FILE "${CHECKER}" "${checker}")
+ 
+ execute_process(COMMAND ${RUNNER} "${checker}" "${TEST_DIR}" "${TEST_DIR}/pipeline_cache.bin" --jobs 1
+                 RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 120)
+-if(NOT log MATCHES "cs pipelines: 1 ok, 0 failed, 0 skipped" OR NOT EXISTS "${TEST_DIR}/pipeline_cache.bin")
+-  if(log MATCHES "no Vulkan physical device|vulkan-1|libvulkan|cs pipelines: 0 ok, 0 failed, 1 skipped")
+-    message(STATUS "SKIP: vk_pipeline_check built no pipeline here\n${log}")
+-    return()
+-  endif()
++# A driver or Wine can mention the loader in unrelated diagnostics. Only the checker's
++# specific unavailability messages and normal all-skipped summary describe a skip.
++set(no_device "no Vulkan physical devices? found|LEONIDA_VK_DEVICE=[^\n]*: no Vulkan physical device matches")
++set(no_loader "could not load vkGetInstanceProcAddr from (vulkan-1[.]dll|libvulkan[.]so[.]1)")
++if((code STREQUAL "1" AND log MATCHES "(^|\n)(${no_device}|${no_loader})(\r?\n|$)")
++   OR (code STREQUAL "0" AND log MATCHES "cs pipelines: 0 ok, 0 failed, 1 skipped"))
++  message(STATUS "pipeline_cache_seed skipped: checker has no usable pipeline\n${log}")
++  return()
++endif()
++if(NOT code STREQUAL "0" OR NOT log MATCHES "cs pipelines: 1 ok, 0 failed, 0 skipped"
++   OR NOT EXISTS "${TEST_DIR}/pipeline_cache.bin")
+   message(FATAL_ERROR "vk_pipeline_check did not build the pipeline (${code})\n${log}")
+ endif()
+ 
+ execute_process(COMMAND ${RUNNER} "${TEST}" "${TEST_DIR}/seed.spv" "${TEST_DIR}/pipeline_cache.bin"
+                 RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 120)
+-message(STATUS "${log}")
+ if(code STREQUAL "77")
+-  return()  # the test printed its own SKIP line
++  message(STATUS "pipeline_cache_seed skipped: runtime cache feedback unavailable\n${log}")
++  return()
+ endif()
+ if(NOT code STREQUAL "0")
+-  message(FATAL_ERROR "pipeline_cache_seed_test failed (${code})")
++  message(FATAL_ERROR "pipeline_cache_seed_test failed (${code})\n${log}")
+ endif()
++message(STATUS "${log}")
+diff --git a/runtime/test/pipeline_cache_seed_test.cpp b/runtime/test/pipeline_cache_seed_test.cpp
+index 2254257b..dfcd2e33 100644
+--- a/runtime/test/pipeline_cache_seed_test.cpp
++++ b/runtime/test/pipeline_cache_seed_test.cpp
+@@ -149,10 +149,13 @@ int main(int argc, char** argv) {
+             own.resize(own.empty() ? 0 : size);
+         }
+         const VkPipelineCache second = own.empty() ? VkPipelineCache{} : make_cache(own.data(), own.size());
+-        const bool reports_hits = second && create(second).hit;
++        const Created control = second ? create(second) : Created{};
+         if (first) vkDestroyPipelineCache(device, first, nullptr);
+         if (second) vkDestroyPipelineCache(device, second, nullptr);
+-        if (reports_hits) {
++        if (!control.ok) {
++            std::fprintf(stderr, "FAIL: could not complete the same-device cache round trip on %s\n",
++                         properties.deviceName);
++        } else if (control.hit) {
+             std::fprintf(stderr,
+                          "FAIL: %s does not hit on the runtime's device (%s), which does hit a cache it wrote itself: "
+                          "vk_pipeline_check's device differs from the runtime's in something the driver makes part "
+-- 
+2.56.1
+
