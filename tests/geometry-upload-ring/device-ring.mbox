@@ -1,0 +1,80 @@
+From 94914a06da139ad47aa5be9b471c3f57ccef02ad Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 17:06:40 +0000
+Subject: [PATCH] Keep the immediate geometry upload ring in its owning device
+ arena
+
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 38 ++++++++++++++-------------
+ 1 file changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 1a9f1d6e..06fe92e4 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -1025,6 +1025,13 @@ struct DeviceState {
+         std::mutex mutex;
+         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+ 
++        struct GeometryRing {
++            std::mutex mutex;
++            VkDeviceSize base = 0;
++            VkDeviceSize next = 0;
++            bool tried = false;
++        } geometry_ring;
++
+         // The high-water mark (D3D-55, open question 5): the arena's size is a guess until a run measures it.
+         // `peak_end` is the highest end offset ever handed out, the size the arena must have; `peak_in_use` is the
+         // most bytes live at once, which differs from it by fragmentation.
+@@ -6038,9 +6045,7 @@ public:
+         state_.context->set_title_memory(
+             [st = &state_](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+                 static constexpr VkDeviceSize kRing = 16ull << 20;
+-                static std::mutex mutex;
+-                static VkDeviceSize ring_base = 0, ring_next = 0;
+-                static bool tried = false, logged = false;
++                auto& ring = st->arena.geometry_ring;
+                 if (!va || !size || size > kRing / 4 || !st->arena.mapped) return false;
+                 // The whole range must be committed, readable host memory.
+                 for (std::uint64_t at = va; at < va + size;) {
+@@ -6050,25 +6055,22 @@ public:
+                         return false;
+                     at = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+                 }
+-                std::lock_guard lock(mutex);
+-                if (!tried) {
+-                    tried = true;
+-                    if (!st->arena_allocate(kRing, 256, ring_base, DeviceState::arena_shader)) ring_base = 0;
+-                }
+-                if (!ring_base) return false;
+-                const VkDeviceSize aligned = (size + 255) & ~VkDeviceSize(255);
+-                if (ring_next + aligned > kRing) ring_next = 0;
+-                std::memcpy(st->arena.mapped + ring_base + ring_next, reinterpret_cast<const void*>(va),
+-                            std::size_t(size));
+-                buffer = st->arena.buffer;
+-                offset = ring_base + ring_next;
+-                ring_next += aligned;
+-                if (!logged) {
+-                    logged = true;
++                std::lock_guard lock(ring.mutex);
++                if (!ring.tried) {
++                    ring.tried = true;
++                    if (!st->arena_allocate(kRing, 256, ring.base, DeviceState::arena_shader)) return false;
+                     std::fprintf(stderr, "[rt] d3d12: vertex/index views in title memory are copied into a "
+                                          "%llu MiB ring (first: %llu bytes)\n",
+                                  static_cast<unsigned long long>(kRing >> 20), static_cast<unsigned long long>(size));
+                 }
++                if (!ring.base) return false;
++                const VkDeviceSize aligned = (size + 255) & ~VkDeviceSize(255);
++                if (ring.next + aligned > kRing) ring.next = 0;
++                std::memcpy(st->arena.mapped + ring.base + ring.next, reinterpret_cast<const void*>(va),
++                            std::size_t(size));
++                buffer = st->arena.buffer;
++                offset = ring.base + ring.next;
++                ring.next += aligned;
+                 return true;
+             });
+         return true;
+-- 
+2.56.1
+
