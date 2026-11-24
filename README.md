@@ -57,6 +57,14 @@ Run `python -I tools/boot_trace.py --d3d12 d3d12.log --counts-only` to share agg
 
 On the saved Windows synthetic presenter run, the parser found one fully black capture and two with color, including the single-pixel frame. With the older rounded-mean output it reported one capture with color and two inconclusive captures. These counts describe the presenter readback in that run. The retail black-screen cause remains open.
 
+## Recovering a damaged shader index
+
+Apply [shader-index-recovery.mbox](shader-index-recovery.mbox) with `git am /path/to/shader-index-recovery.mbox`. The patch applies independently to `de4c37383cad386eaa851047628d7b92c51009c5`. Its clean replay produced tree `b83aa1dcc162f61dfa061b8a1ea1c38e75e66e70`.
+
+Previously, the shaders stage could report success after a user reran it with a truncated `shaders/spirv/index.json`. The pipelines stage then rejected the same file and asked for another rerun. The fix rebuilds a malformed index from completed shards when the translation plan still matches. The low-disk preflight accounts for a merge-only retry. A temporarily locked index is preserved.
+
+The regression uses two synthetic pixel shaders, the actual translator, SPIRV-Tools and two shard workers. After truncating the merged index, the patched shaders stage restored the exact original bytes. Both compiled modules and both shard indexes retained their contents and modification times. Run `python -I tests/test_make_game_empty_translation.py ShadersStageTest.test_real_shards_restore_the_index_without_rebuilding_modules` with SPIRV-Tools on PATH to repeat it.
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
