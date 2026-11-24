@@ -1,0 +1,480 @@
+From 42bf90937029b07a3c928820b3c3ace3a53f921c Mon Sep 17 00:00:00 2001
+From: tedin7 <tommasoderosa94@gmail.com>
+Date: Tue, 24 Nov 2026 00:35:11 +0100
+Subject: [PATCH 1/2] fix: rdna2spirv decodes scalar, image and buffer tuples
+ that run into vcc from the blob when llvm-mc rejects them
+
+llvm-mc skips the first word of s_buffer_load_dwordx8 into s[100:107], an image resource in s[100:107] or a buffer resource in s[104:107] and leaves the second word as junk, so translate() refused those shaders (reachable instruction with normalized encoding) or translated them without the load. restore_vcc_tuples reads the uncovered words of the code range with rdna2_decode and keeps only instructions whose operands hold a VCCTuple list, the form the translator already takes. Other undecodable words are unchanged.
+
+diff --git a/docs/shader_library.md b/docs/shader_library.md
+index 891a740c107e4ea0845513d8683230c612dc3aac..193e4714c9d043d8c8db7d68cd2b9fa104c9c1ba 100644
+--- a/docs/shader_library.md
++++ b/docs/shader_library.md
+@@ -150,9 +150,11 @@ What stops the rest, by the translator's message:
+   run into `vcc` (SGPRs 106 and 107): `s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or
+   `s[92:107]`, and image instructions whose resource is `s[100:107]`. In the compute programs alone that is 37,952
+   SMEM, 22,248 MIMG and 2,298 MUBUF words. The same words with the register field one tuple lower decode; with
+-  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. A decoder
+-  fallback for these encodings would cover most of the remaining programs. The translator already reads
+-  `[s100,...,vcc_lo,vcc_hi]` lists (design.md *Scalar/buffer memory*).
++  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. The translator
++  now decodes these words from the blob with `rdna2_decode` (`restore_vcc_tuples`) and reads them as the
++  `[s100,...,vcc_lo,vcc_hi]` lists it already takes (design.md *Scalar/buffer memory*); synthetic cases are in
++  `tests/semantic/test_vcc_tuple_fallback.py`. The count above was measured before this change; it has not been
++  re-run on the real library.
+ * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
+   the existing `check_printed_encodings` refusal.
+ * **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
+diff --git a/tests/semantic/test_vcc_tuple_fallback.py b/tests/semantic/test_vcc_tuple_fallback.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd02b4509a10b421fcf253a4e4e7183e4c56fa4e
+--- /dev/null
++++ b/tests/semantic/test_vcc_tuple_fallback.py
+@@ -0,0 +1,149 @@
++"""A scalar tuple that runs into vcc is translated from the blob when llvm-mc cannot decode it.
++
++llvm-mc rejects s_buffer_load_dwordx8 into s[100:107], a buffer resource in s[104:107] and an image resource in
++s[100:107] (SGPRs 106 and 107 are vcc). It skips the first word as invalid and leaves the second word as junk, so
++translate() refused every such shader ("reachable instruction with normalized encoding", or "fall-through into
++undecodable words"; docs/shader_library.md section 5), or, when the junk matched the blob, translated a program
++with the load missing. The words are now decoded from the blob as the VCCTuple lists the translator takes.
++
++Hand-built listings and blobs of synthetic instructions (encodings from llvm-mc 19, the three tuple words patched in
++their register field), no game data.
++
++    python -I tests/semantic/test_vcc_tuple_fallback.py -v
++"""
++import os
++import struct
++import sys
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++if HERE not in sys.path:
++    sys.path.insert(0, HERE)
++
++from support import rdna2spirv, translate_listing  # noqa: E402
++import fssm_header  # noqa: E402
++import spirv_mini_interp as si  # noqa: E402
++
++NAME = "cs_vcc_tuple"
++CODE_START = 0x148
++BASE, OUT = 0x1000, 0x3000
++INVALID = "; warning: invalid instruction encoding"
++
++SET_SGPR_V = [  # s4..s7 = a V# over BASE (32 bytes), as tests/semantic/test_fspx_rules.py builds it
++    ("s_mov_b32 s4, 0x1000", "ff 03 84 be 00 10 00 00"),
++    ("s_mov_b32 s5, 0", "80 03 85 be"),
++    ("s_mov_b32 s6, 32", "a0 03 86 be"),
++    ("s_mov_b32 s7, 0x30000000", "ff 03 87 be 00 00 00 30"),
++]
++WAIT = ("s_waitcnt lgkmcnt(0)", "7f c0 8c bf")
++WAIT_V = ("s_waitcnt vmcnt(0)", "70 3f 8c bf")
++STORE_X4 = [
++    ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
++    ("global_store_dwordx4 v6, v[10:13], s[0:1]", "00 80 78 dc 06 0a 00 00"),
++    ("s_endpgm", "00 00 81 bf"),
++]
++# the words llvm-mc cannot decode (each is two dwords): the llvm-mc 19 encoding of the same instruction one tuple
++# lower, with its register field patched into vcc
++LOAD_X8_VCC = "02 19 2c f4 00 00 00 fa"        # s_buffer_load_dwordx8 [s100..s105,vcc_lo,vcc_hi], s[4:7], 0x0
++LOAD_X4_VCC = "02 1a 28 f4 00 00 00 fa"        # s_buffer_load_dwordx4 [s104,s105,vcc_lo,vcc_hi], s[4:7], 0x0
++LOAD_DW_FROM_VCC = "b4 02 20 f4 00 00 00 fa"   # s_buffer_load_dword s10, [s104,s105,vcc_lo,vcc_hi], 0x0
++BUFFER_LOAD_VCC = "00 10 30 e0 01 0b 1a 80"    # buffer_load_dword v11, v1, [s104,s105,vcc_lo,vcc_hi], 0 offen
++IMAGE_LOAD_VCC = "08 1f 00 f0 01 04 19 00"     # image_load v[4:7], v[1:2], [s100..s105,vcc_lo,vcc_hi] 2D unorm
++PROGRAM_VARIANTS = ("invalid", "junk", "normalized")
++
++
++def encoding(raw):
++    return "; encoding: [" + ",".join(f"0x{b:02x}" for b in bytes.fromhex(raw)) + "]"
++
++
++def listing_and_blob(program, variant="invalid"):
++    """program: (text, hex) pairs; a pair whose text is None is a word llvm-mc rejects, listed as the variant says."""
++    code = b"".join(bytes.fromhex(raw) for _, raw in program)
++    lines = []
++    for text, raw in program:
++        if text is not None:
++            lines.append(f"\t{text:<40}{encoding(raw)}")
++            continue
++        second = bytes.fromhex(raw)[4:8]
++        lines.append(INVALID)
++        if variant == "invalid":
++            lines.append(INVALID)
++        elif variant == "junk":         # the second word decodes as an instruction of its own, bytes as stored
++            lines.append(f"\ts_nop 0{'':<33}" + encoding(second.hex()))
++        else:                           # printed with another encoding than the blob holds
++            lines.append("\texp mrt0 v0, v0, v0, v0 done vm " + encoding("0f 18 00 f8 00 00 00 00"))
++    head = f"; {NAME}  code 0x{CODE_START:x}..0x{CODE_START + len(code):x} (scan), gfx1013, 2 invalid words"
++    header = bytearray(CODE_START)
++    struct.pack_into("<4I", header, 0x138, 0x88, 32, 1, 1)
++    struct.pack_into("<I", header, fssm_header.WAVE_FLAGS_OFFSET, 0x20)       # wave32
++    return ((head + "\n" + "\n".join(lines) + "\n").encode(), bytes(header) + code)
++
++
++def translate(program, variant="invalid"):
++    data, blob = listing_and_blob(program, variant)
++    return translate_listing(NAME, data, fssm=blob)
++
++
++def run(spv, memory):
++    mem = dict(memory)
++    si.run_workgroup(spv, 1, 32, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
++                     push_constants=[0] * 36, memory=mem)
++    return mem
++
++
++class VccTupleFallbackTest(unittest.TestCase):
++    def test_load_into_a_tuple_ending_in_vcc(self):
++        program = SET_SGPR_V + [
++            (None, LOAD_X8_VCC), WAIT,
++            ("v_mov_b32_e32 v10, s100", "64 02 14 7e"), ("v_mov_b32_e32 v11, s105", "69 02 16 7e"),
++            ("v_mov_b32_e32 v12, vcc_lo", "6a 02 18 7e"), ("v_mov_b32_e32 v13, vcc_hi", "6b 02 1a 7e"),
++        ] + STORE_X4
++        words = [0x11110000 + i for i in range(8)]
++        for variant in PROGRAM_VARIANTS:
++            with self.subTest(printed_as=variant):
++                mem = run(translate(program, variant), {BASE + 4 * i: w for i, w in enumerate(words)})
++                self.assertEqual([mem.get(OUT + 4 * i) for i in range(4)], [words[0], words[5], words[6], words[7]])
++
++    def test_buffer_resource_in_vcc(self):
++        # a V# loaded into [s104,s105,vcc_lo,vcc_hi], then read by s_buffer_load and by buffer_load
++        program = SET_SGPR_V + [
++            (None, LOAD_X4_VCC), WAIT,
++            (None, LOAD_DW_FROM_VCC), WAIT,
++            ("v_mov_b32_e32 v1, 4", "84 02 02 7e"),
++            (None, BUFFER_LOAD_VCC), WAIT_V,
++            ("v_mov_b32_e32 v10, s10", "0a 02 14 7e"),
++            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
++            ("global_store_dwordx2 v6, v[10:11], s[0:1]", "00 80 74 dc 06 0a 00 00"),
++            ("s_endpgm", "00 00 81 bf"),
++        ]
++        memory = {BASE + 4 * i: w for i, w in enumerate([BASE + 0x100, 0, 16, 0x30000000])}
++        memory[BASE + 0x100], memory[BASE + 0x104] = 0xCAFE1234, 0xBEEF5678
++        for variant in PROGRAM_VARIANTS:
++            with self.subTest(printed_as=variant):
++                mem = run(translate(program, variant), memory)
++                self.assertEqual([mem.get(OUT), mem.get(OUT + 4)], [0xCAFE1234, 0xBEEF5678])
++
++    def test_image_resource_in_vcc(self):
++        program = SET_SGPR_V + [
++            (None, LOAD_X8_VCC), WAIT,
++            ("v_mov_b32_e32 v1, 0", "80 02 02 7e"), ("v_mov_b32_e32 v2, 0", "80 02 04 7e"),
++            (None, IMAGE_LOAD_VCC), WAIT_V,
++            ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00"),
++            ("global_store_dword v6, v4, s[0:1]", "00 80 70 dc 06 04 00 00"),
++            ("s_endpgm", "00 00 81 bf"),
++        ]
++        for variant in PROGRAM_VARIANTS:
++            with self.subTest(printed_as=variant):
++                self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(program, variant))
++
++    def test_other_undecodable_words_are_still_refused(self):
++        # SHADER-813: a rejected word that is not a tuple into vcc (sdata 112, not a register) stays undecodable,
++        # and the code that runs into it is refused
++        word = "02 1c 2c f4 00 00 00 fa"
++        program = SET_SGPR_V + [(None, word)] + STORE_X4
++        with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
++            translate(program)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 645e2fb3b5489bac570cd675f8cb4c543893d50b..f76ac2045d3f2f0df24c73aabb910cbbb051f315 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -17024,6 +17024,41 @@ def restore_mix_inline_literal(ins, raw, literal):
+     ins["enc"] = raw.hex()
+ 
+ 
++def restore_vcc_tuples(insns, blob, code_start, code_end):
++    """Put back the scalar-memory, image and buffer instructions whose register tuple runs into vcc.
++
++    llvm-mc rejects a tuple that reaches SGPRs 106 and 107 (s_load_dwordx8 into s[100:107], an image resource in
++    s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
++    as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
++    The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
++    translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
++    is offered to it; the instruction is used only if its operands hold such a list, so no other undecodable word
++    changes. Instructions printed inside the words of a restored one are dropped. The instructions already carry
++    their blob offsets in "pc"; returns the list sorted by it."""
++    import rdna2_decode
++    covered = set()
++    for ins in insns:
++        if not ins.get("normalized"):
++            covered.update(range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))
++    stop = min(len(blob), code_end if code_end is not None else len(blob))
++    restored, at = [], code_start
++    while at + 8 <= stop:
++        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:at + 20])["insns"][:1]
++        if found and found[0]["pc"] == 0 and any(
++                a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"]):
++            ins = found[0]
++            ins["pc"] = at
++            restored.append(ins)
++            at += len(ins["enc"]) // 2
++        else:
++            at += 4
++    if not restored:
++        return insns
++    spans = [(r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored]
++    kept = [i for i in insns if not any(i["pc"] < hi and i["pc"] + len(i["enc"]) // 2 > lo for lo, hi in spans)]
++    return sorted(kept + restored, key=lambda i: i["pc"])
++
++
+ def output_signature(path, name):
+     """OSG1 elements as (register, system value), one per register (first element wins)."""
+     d = shader_container(path, name)
+@@ -17289,6 +17324,7 @@ def translate(path):
+                 ins["normalized"] = True
+             ins["pc"] = at
+             pos = at + len(enc)
++        insns = restore_vcc_tuples(insns, blob, info["code_start"], info.get("code_end"))
+         insns = fold_far_branches(insns)
+         insns = reachable_code(insns, info.get("code_end"))
+         if any(i.get("normalized") for i in insns):
+
+From e875079597e387f184d9531d33a8d7b334fc32f3 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 03:37:29 +0000
+Subject: [PATCH 2/2] Recover the shader instruction consumed by LLVM 19 after
+ a VCC tuple
+
+Keep recovery within the declared program. Preserve the normalized rejection for reachable exports and the source wave and GPU modes when decoding a swallowed successor.
+
+diff --git a/docs/shader_library.md b/docs/shader_library.md
+index 193e4714c9d043d8c8db7d68cd2b9fa104c9c1ba..f883c6b4fb08a23a7c54855c177d6631ca6b5b7a 100644
+--- a/docs/shader_library.md
++++ b/docs/shader_library.md
+@@ -155,6 +155,10 @@ What stops the rest, by the translator's message:
+   `[s100,...,vcc_lo,vcc_hi]` lists it already takes (design.md *Scalar/buffer memory*); synthetic cases are in
+   `tests/semantic/test_vcc_tuple_fallback.py`. The count above was measured before this change; it has not been
+   re-run on the real library.
++  On synthetic gfx1013 inputs, LLVM 19.1.7 can also consume the next instruction's first dword as
++  part of a spurious export. Recovery resumes at the end of the register-tuple instruction and stays
++  within the program's declared code range. LLVM 23.1.5 prints the complete register lists directly
++  for the tested scalar loads and buffer and image resources. The library count above is historical.
+ * **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
+   the existing `check_printed_encodings` refusal.
+ * **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
+diff --git a/tests/semantic/test_vcc_tuple_fallback.py b/tests/semantic/test_vcc_tuple_fallback.py
+index dd02b4509a10b421fcf253a4e4e7183e4c56fa4e..d1ffa17f9f982d3ddc3a55c56059394426ed701d 100644
+--- a/tests/semantic/test_vcc_tuple_fallback.py
++++ b/tests/semantic/test_vcc_tuple_fallback.py
+@@ -136,6 +136,35 @@ class VccTupleFallbackTest(unittest.TestCase):
+             with self.subTest(printed_as=variant):
+                 self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(program, variant))
+ 
++    def test_llvm19_export_overlaps_the_following_literal_move(self):
++        # LLVM 19 reports the first SMEM word as invalid, reads the second as a normalized export,
++        # and consumes the first word of the literal address move as its operands.
++        move = ("v_mov_b32_e32 v6, 0x3000", "ff 02 0c 7e 00 30 00 00")
++        read = ("v_mov_b32_e32 v10, s100", "64 02 14 7e")
++        store = ("global_store_dword v6, v10, s[0:1]", "00 80 70 dc 06 0a 00 00")
++        program = SET_SGPR_V + [(None, LOAD_X8_VCC), move, WAIT, read, store, STORE_X4[-1]]
++        data, blob = listing_and_blob(program)
++        lines = data.decode().splitlines()
++        exp = "\texp mrt0 off, off, off, off " + encoding("00 00 00 f8 ff 02 0c 7e")
++        at = lines.index(INVALID)
++        lines[at:at + 3] = [INVALID, exp, INVALID]
++        spv = translate_listing(NAME, ("\n".join(lines) + "\n").encode(), fssm=blob)
++        self.assertEqual(run(spv, {BASE: 0x1A2B3C4D}).get(OUT), 0x1A2B3C4D)
++
++    def test_image_address_words_must_be_inside_the_code_range(self):
++        # An NSA image instruction has up to three trailing dwords holding address VGPRs.
++        # A pipeline blob may have more bytes after the program's declared end.
++        for opcode, count in ((0x0a, 1), (0x0c, 2), (0x0e, 3)):
++            with self.subTest(address_words=count):
++                image = f"{opcode:02x} 1f 00 f0 01 04 19 00"
++                prefix = SET_SGPR_V + [(None, LOAD_X8_VCC), WAIT]
++                tail = bytes.fromhex("02 00 00 00") * count
++                data, blob = listing_and_blob(prefix + [(None, image)])
++                with self.assertRaisesRegex(rdna2spirv.Unsupported, "fall-through into undecodable words"):
++                    translate_listing(NAME, data, fssm=blob + tail)
++                complete = prefix + [(None, image + " " + tail.hex()), WAIT_V] + STORE_X4
++                self.assertIn("OpFunctionCall %uint %desc_lookup_fn", translate(complete))
++
+     def test_other_undecodable_words_are_still_refused(self):
+         # SHADER-813: a rejected word that is not a tuple into vcc (sdata 112, not a register) stays undecodable,
+         # and the code that runs into it is refused
+diff --git a/tools/rdna2_decode.py b/tools/rdna2_decode.py
+index e95b36320e6d4756581bae02e321011f98f6ed35..3ec83b5f9ef8f0b8a4cbd4d8ff30a65db4d517ab 100644
+--- a/tools/rdna2_decode.py
++++ b/tools/rdna2_decode.py
+@@ -1420,6 +1420,11 @@ def _iter_insns(code: bytes, wave32: bool, code_start: int, mcpu: str) -> Iterat
+         yield ins
+ 
+ 
++def decode_instruction(code: bytes, *, wave32: bool = True, mcpu: str = "gfx1013") -> dict | None:
++    """Decode the first instruction, returning None if it is unknown or incomplete."""
++    return _decode_one(code, 0, wave32, mcpu)[0]
++
++
+ def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
+     """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
+     insns = []
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index f76ac2045d3f2f0df24c73aabb910cbbb051f315..3eb29576869b18dcf3fb722d8239ed00aeba94ee 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -17024,39 +17024,63 @@ def restore_mix_inline_literal(ins, raw, literal):
+     ins["enc"] = raw.hex()
+ 
+ 
+-def restore_vcc_tuples(insns, blob, code_start, code_end):
++def has_vcc_tuple(ins):
++    return ins is not None and any(a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"])
++                                   for a in ins["args"])
++
++
++def restore_vcc_tuples(insns, blob, code_start, code_end, wave_size, mcpu):
+     """Put back the scalar-memory, image and buffer instructions whose register tuple runs into vcc.
+ 
+     llvm-mc rejects a tuple that reaches SGPRs 106 and 107 (s_load_dwordx8 into s[100:107], an image resource in
+     s[100:107], a buffer resource in s[104:107]): it skips the first word as invalid and then prints the second word
+     as an instruction of its own, one that is junk or does not match the blob (docs/shader_library.md section 5).
+-    The pure-Python decoder reads such a word as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
++    The pure-Python decoder reads such an instruction as a VCCTuple list, [s100,...,s105,vcc_lo,vcc_hi], the form the
+     translator takes for these instructions. Every blob dword in the code range that no matched instruction covers
+-    is offered to it; the instruction is used only if its operands hold such a list, so no other undecodable word
+-    changes. Instructions printed inside the words of a restored one are dropped. The instructions already carry
++    is considered for a VCC tuple. An overlapping listing entry may also have consumed a following instruction,
++    which is recovered at the native boundary. Other gaps remain undecodable. The instructions already carry
+     their blob offsets in "pc"; returns the list sorted by it."""
+     import rdna2_decode
+-    covered = set()
+-    for ins in insns:
+-        if not ins.get("normalized"):
+-            covered.update(range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4))
++    by_pc = {ins["pc"]: ins for ins in insns}
++
++    def words(ins):
++        return range(ins["pc"], ins["pc"] + len(ins["enc"]) // 2, 4)
++
++    covered = {pc for ins in insns if not ins.get("normalized") for pc in words(ins)}
+     stop = min(len(blob), code_end if code_end is not None else len(blob))
+-    restored, at = [], code_start
+-    while at + 8 <= stop:
+-        found = None if at in covered else rdna2_decode.decode_bytes(blob[at:at + 20])["insns"][:1]
+-        if found and found[0]["pc"] == 0 and any(
+-                a["k"] == "slist" and ("vcc_lo" in a["r"] or "vcc_hi" in a["r"]) for a in found[0]["args"]):
+-            ins = found[0]
+-            ins["pc"] = at
+-            restored.append(ins)
+-            at += len(ins["enc"]) // 2
+-        else:
++    restored, replaced = [], set()
++    consumed_end = at = code_start
++    while at < stop:
++        # A listing instruction that started inside a restored tuple can have consumed the first
++        # word of its successor. Resume decoding at the actual boundary until the streams meet.
++        swallowed = at < consumed_end and at not in by_pc
++        if not swallowed and (at in covered or at + 8 > stop):
+             at += 4
++            continue
++        raw = blob[at:min(stop, at + 20)]
++        ins = rdna2_decode.decode_instruction(raw, wave32=wave_size != 64, mcpu=mcpu or "gfx1013")
++        if ins is None or (not swallowed and not has_vcc_tuple(ins)):
++            at += 4
++            continue
++        if swallowed and (wave_size is None or mcpu is None):
++            # Without complete metadata, recover only when the possible interpretations agree.
++            waves = (True, False) if wave_size is None else (wave_size == 32,)
++            targets = ("gfx1013", "gfx1030") if mcpu is None else (mcpu,)
++            if any(rdna2_decode.decode_instruction(raw, wave32=w, mcpu=t) != ins for w in waves for t in targets):
++                at += 4
++                continue
++        ins["pc"] = at
++        span = words(ins)
++        for pc in span[1:]:
++            if pc in by_pc:
++                consumed_end = max(consumed_end, words(by_pc[pc]).stop)
++        restored.append(ins)
++        replaced.update(span)
++        at = span.stop
+     if not restored:
+         return insns
+-    spans = [(r["pc"], r["pc"] + len(r["enc"]) // 2) for r in restored]
+-    kept = [i for i in insns if not any(i["pc"] < hi and i["pc"] + len(i["enc"]) // 2 > lo for lo, hi in spans)]
+-    return sorted(kept + restored, key=lambda i: i["pc"])
++    kept = [ins for ins in insns if replaced.isdisjoint(words(ins))]
++    return sorted(kept + restored, key=lambda ins: ins["pc"])
+ 
+ 
+ def output_signature(path, name):
+@@ -17288,7 +17312,16 @@ def translate(path):
+         # parse_file only reads tab-indented instructions, so a hand-written or re-indented .s parses to nothing
+         # and used to translate to a module that passes spirv-val and does no work at all. Refuse it instead.
+         raise Unsupported("no instructions (nothing tab-indented?)")
++    fssm_path, fspx_path, _ = native_paths(path, info["name"])
++    fssm_ws = None
++    try:
++        with open(fssm_path, "rb") as f:
++            fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
++    except OSError:
++        pass
++    fspx_ws = fspx_wave_size(path, info["name"]) if fssm_ws is None else None
+     if info["invalid"]:
++        import rdna2_decode
+         # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
+         # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
+         # translate only code reachable from entry; a branch into data is rejected below.
+@@ -17299,6 +17332,14 @@ def translate(path):
+             op, operand_count = ins["op"], len(ins["args"])
+             skipped, at = 0, pos
+             while not same_encoding(blob[at:at + len(enc)], enc, op, operand_count):
++                # LLVM 19 decodes a scalar load's second word (0xfa000000) as an EXP whose
++                # reserved bits it clears. Anchor that listing entry to its real two dwords.
++                # It remains normalized and is rejected unless unreachable or replaced by a tuple.
++                if (op == "exp" and len(enc) == 8 and enc[3] == 0xf8 and at >= info["code_start"] + 4
++                        and blob[at:at + 8] == enc[:3] + b"\xfa" + enc[4:]
++                        and has_vcc_tuple(rdna2_decode.decode_instruction(blob[at - 4:at + 4]))):
++                    ins["normalized"] = True
++                    break
+                 literal = mix_literal(blob[at:at + len(enc)], enc, base_op(op))
+                 if literal is not None:
+                     restore_mix_literal(ins, blob[at:at + len(enc)], literal)
+@@ -17324,7 +17365,8 @@ def translate(path):
+                 ins["normalized"] = True
+             ins["pc"] = at
+             pos = at + len(enc)
+-        insns = restore_vcc_tuples(insns, blob, info["code_start"], info.get("code_end"))
++        insns = restore_vcc_tuples(insns, blob, info["code_start"], info.get("code_end"),
++                                   fssm_ws or fspx_ws, info.get("mcpu"))
+         insns = fold_far_branches(insns)
+         insns = reachable_code(insns, info.get("code_end"))
+         if any(i.get("normalized") for i in insns):
+@@ -17349,19 +17391,11 @@ def translate(path):
+     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
+     # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
+     # synthetic listings).
+-    fssm_path, fspx_path, _ = native_paths(path, info["name"])
+-    fssm_ws = None
+-    try:
+-        with open(fssm_path, "rb") as f:
+-            fssm_ws = fssm_header.wave_size(f.read(fssm_header.WAVE_FLAGS_OFFSET + 4))
+-    except OSError:
+-        pass
+     # An FSPX program (the FidelityFX DLL's) has no FSSM header; its kind-0 dispatch state carries the wave size
+     # instead (word 4 bit 20 = wave32, docs/fspx.md). Only the strict markers count against it: a _b64 op on vcc or
+     # exec is not one, since these programs move vcc as an ordinary SGPR pair (s_mov_b64 vcc, s[..]) in wave32 code.
+     # Nor is s_bfm_b64: it is 64-bit data in wave32 code (958 pipeline-library compute programs whose state says
+     # wave32, 905 of them with *_saveexec_b32, build an S# with it; see the s_bfm_b64 translation).
+-    fspx_ws = fspx_wave_size(path, info["name"]) if fssm_ws is None else None
+     if fssm_ws is not None:
+         if fssm_ws == 32 and code_w64:
+             raise Unsupported("FSSM wave32 header contradicts wave64 code")
+diff --git a/tools/shader_ir.py b/tools/shader_ir.py
+index 2a4db1b0ddaf4310ff0b11c9bdb448c5abaf9f25..eee43a72ceea05cf9143da42be0db76899f10749 100644
+--- a/tools/shader_ir.py
++++ b/tools/shader_ir.py
+@@ -250,6 +250,8 @@ def parse_file(path):
+     # the end of the code range the header declares (exclusive), None without a header: undecodable words can sit
+     # between the last printed instruction and it
+     info["code_end"] = int(m.group(3), 16) if m else None
++    if m and (cpu := re.search(r", (gfx[0-9a-f]+),", lines[0][m.end():])):
++        info["mcpu"] = cpu.group(1)
+     start = 1 if (lines and not lines[0].startswith("\t")) else 0
+     for ln in lines[start:]:
+         if ln.startswith("; ---"):

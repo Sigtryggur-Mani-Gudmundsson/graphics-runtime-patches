@@ -109,6 +109,12 @@ Apply [index-view-bounds.mbox](index-view-bounds.mbox) with `git am` to the base
 
 Indexed draws now preserve indices inside a view and read zero beyond its end. A native RTX 4070 Ti readback reproduced eight wrong images on the original replay. All ten images matched after the fix, with synchronization validation enabled. [Test source, results and reproduction instructions](tests/index-view/README.md)
 
+## Recovering pipeline shaders with register tuples that end in VCC
+
+Apply [vcc-tuple-recovery.mbox](vcc-tuple-recovery.mbox) with `git am` to the base commit. The first commit preserves tedin7’s [PR 327](https://github.com/ubiquitarianism/leonida/pull/327). The second recovers a shader instruction consumed by LLVM 19 after a register tuple and bounds recovery to the declared program. Applying both to the base produced tree `e6e6d927ab2abdd135f6a5fb5f6507ffef232bf1`.
+
+The original PR refused all six synthetic programs from real LLVM 19 listings. The follow-up validated all six under LLVM 19.1.7 and 23.1.5. Five programs produced the expected words on an RTX 4070 Ti under each toolchain. [Test, measurements and reproduction commands](tests/vcc-tuples/README.md)
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
