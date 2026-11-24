@@ -1,0 +1,147 @@
+From 4df77ab2ca655b95a122cc596251ec6c99412686 Mon Sep 17 00:00:00 2001
+From: Yash Dubey <yash.dubey803at@gmail.com>
+Date: Tue, 24 Nov 2026 07:31:12 +0530
+Subject: [PATCH 1/2] hashdict: --archives ignores spaces and refuses an
+ archive the carve does not have
+
+
+diff --git a/tests/test_hashdict.py b/tests/test_hashdict.py
+index 801235a98d333cc56d4f7d1e179c9d5477b6f1b1..aa913c2552b58db9e59b11cf13fcaca6523ab42e 100644
+--- a/tests/test_hashdict.py
++++ b/tests/test_hashdict.py
+@@ -418,6 +418,47 @@ class CarveAndExtraCLITest(unittest.TestCase):
+         with open(self.out_json, encoding="utf-8") as f:
+             self.assertEqual(json.load(f), {f"{hashdict.joaat('pso_metadata_token'):08x}": "pso_metadata_token"})
+ 
++    def archive_names(self, *args):
++        p = self.run_tool(self.carve_dir, "--out", self.out_json, *args)
++        self.assertEqual(p.returncode, 0, p.stderr)
++        with open(self.out_json, encoding="utf-8") as f:
++            return set(json.load(f).values())
++
++    def test_archives_list_ignores_spaces_and_empty_entries(self):
++        # "common, custom_pack" used to select only common: " custom_pack" matched no archive, silently
++        names = self.archive_names("--archives", " common, custom_pack ,,")
++        self.assertIn("common_archive_asset", names)
++        self.assertIn("pso_metadata_token", names)
++        # an empty list harvests only the PSIN/RBF0 blobs
++        names = self.archive_names("--archives", "")
++        self.assertNotIn("common_archive_asset", names)
++        self.assertIn("pso_metadata_token", names)
++
++    def test_archive_named_but_not_carved_is_a_usage_error(self):
++        previous = {"00000001": "previous_name"}
++        with open(self.out_json, "w", encoding="utf-8") as f:
++            json.dump(previous, f)
++        common = os.path.join(self.carve_dir, "common")
++        for carve, archives, message in (
++                (self.carve_dir, "comon,custom_pack", "--archives: comon not found"),
++                (self.carve_dir, "common, data", "--archives: data not found"),
++                # a one-archive folder holds that archive only
++                (common, "custom_pack", "(archives there: common)")):
++            p = self.run_tool(carve, "--out", self.out_json, "--archives", archives)
++            self.assertEqual(p.returncode, 2, p.stderr)
++            self.assertIn("usage:", p.stderr)
++            self.assertIn(message, p.stderr)
++            self.assertNotIn("Traceback", p.stderr)
++            self.assertEqual(p.stdout, "")
++            with open(self.out_json, encoding="utf-8") as f:
++                self.assertEqual(json.load(f), previous)
++
++    def test_default_archives_absent_from_a_partial_carve_are_not_an_error(self):
++        # the default list names data, script, ... which this carve lacks
++        names = self.archive_names()
++        self.assertIn("common_archive_asset", names)
++        self.assertIn("pso_metadata_token", names)
++
+     def test_out_naming_a_one_archive_index_is_refused(self):
+         index = os.path.join(self.carve_dir, "common", "index.json")
+         with open(index, "rb") as f:
+diff --git a/tools/hashdict.py b/tools/hashdict.py
+index f005f322bc1f6cf2aaf879d1d132776e71a28d80..fc0887e9676ed5e094790c804cb75a7e9e6534b6 100644
+--- a/tools/hashdict.py
++++ b/tools/hashdict.py
+@@ -39,6 +39,8 @@ META_HEADS = ("5053494e", "52424630")                # PSIN, RBF0
+ NEW_STREAM_HEADS = META_HEADS + ("3c3f786d6c", "efbbbf3c3f786d6c")
+ # A stream whose inflated size is a non-zero multiple of this continues in the next one (docs/page_directory.md).
+ CONTINUATION_BLOCK = 65536
++# Archives harvested fully when --archives is not given. A partial carve may lack some of them: that is not an error.
++DEFAULT_ARCHIVES = "common,data,script,pack_story000_story000_script,textures"
+ 
+ 
+ def joaat(s: str) -> int:
+@@ -75,7 +77,7 @@ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("carve", nargs="?")
+     ap.add_argument("--out", default="hashes.json")
+-    ap.add_argument("--archives", default="common,data,script,pack_story000_story000_script,textures")
++    ap.add_argument("--archives", help=f"comma-separated archives to harvest fully (default: {DEFAULT_ARCHIVES})")
+     ap.add_argument("--extra", nargs="*", default=[])
+     ap.add_argument("--min", type=int, default=3)
+     ap.add_argument("--lookup", nargs="+", metavar="VALUE", help="dictionary path followed by one or more hashes")
+@@ -118,6 +120,16 @@ def main():
+         archives = [(os.path.basename(os.path.normpath(os.path.abspath(a.carve))), a.carve)]
+     else:
+         archives = [(d, os.path.join(a.carve, d)) for d in sorted(os.listdir(a.carve))]
++    # "common, data" names "common" and "data". An archive named on the command line that is not in the carve is
++    # a typo or the wrong folder, not a partial carve: refuse it rather than harvest without it. The default list
++    # may name archives a partial carve lacks.
++    full = {x.strip() for x in (DEFAULT_ARCHIVES if a.archives is None else a.archives).split(",")} - {""}
++    if a.archives is not None:
++        found = [arch for arch, d in archives if os.path.isfile(os.path.join(d, "index.json"))]
++        unknown = sorted(full.difference(found))
++        if unknown:
++            ap.error(f"--archives: {', '.join(unknown)} not found in {a.carve} "
++                     f"(archives there: {', '.join(found) or 'none'})")
+     # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
+     # samefile also catches a case-only difference on Windows and macOS's default volume.
+     if os.path.exists(a.out):
+@@ -140,7 +152,6 @@ def main():
+     except OSError:
+         output_stat = None
+     strings = set()
+-    full = set(a.archives.split(","))
+     missing = []                    # carved blobs an index.json lists that can't be read: skipped, reported
+     for arch, arch_dir in archives:
+         p = os.path.join(arch_dir, "index.json")
+
+From 9f08827c09c81a6515c6c2d3faa9586db40fc1d9 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 02:10:11 +0000
+Subject: [PATCH 2/2] test: distinguish full archive harvest from metadata-only
+ selection
+
+
+diff --git a/tests/test_hashdict.py b/tests/test_hashdict.py
+index aa913c2552b58db9e59b11cf13fcaca6523ab42e..ab5a8af7d88233969f51289c97b5283412605d62 100644
+--- a/tests/test_hashdict.py
++++ b/tests/test_hashdict.py
+@@ -305,12 +305,15 @@ class CarveAndExtraCLITest(unittest.TestCase):
+         meta_index = {
+             "files": [
+                 {"off": 32, "head": "5053494e1234", "type": "bin"},
++                {"off": 48, "head": "00000000", "type": "bin"},
+             ]
+         }
+         with open(os.path.join(meta_dir, "index.json"), "w", encoding="utf-8") as f:
+             json.dump(meta_index, f)
+         with open(os.path.join(meta_dir, f"{32:012x}.bin"), "wb") as f:
+             f.write(b"\x00\x00pso_metadata_token\x00\x00")
++        with open(os.path.join(meta_dir, f"{48:012x}.bin"), "wb") as f:
++            f.write(b"\x00custom_archive_asset\x00")
+ 
+         # 3. Extra directory with filenames
+         self.extra_dir = os.path.join(self.dir, "extra_files")
+@@ -428,10 +431,12 @@ class CarveAndExtraCLITest(unittest.TestCase):
+         # "common, custom_pack" used to select only common: " custom_pack" matched no archive, silently
+         names = self.archive_names("--archives", " common, custom_pack ,,")
+         self.assertIn("common_archive_asset", names)
++        self.assertIn("custom_archive_asset", names)
+         self.assertIn("pso_metadata_token", names)
+         # an empty list harvests only the PSIN/RBF0 blobs
+         names = self.archive_names("--archives", "")
+         self.assertNotIn("common_archive_asset", names)
++        self.assertNotIn("custom_archive_asset", names)
+         self.assertIn("pso_metadata_token", names)
+ 
+     def test_archive_named_but_not_carved_is_a_usage_error(self):

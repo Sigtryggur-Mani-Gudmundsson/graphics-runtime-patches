@@ -29,6 +29,12 @@ The Windows drawing guest and presenter measurements are in [windows-guest-frame
 
 The tenth commit fixes the optional KHR ray-tracing path. A short overlapping buffer could hide the CPU mapping for an instance pointer list. The queue also used the global arena base when translating descriptors in imported buffers. The new queue regression checks the staged Vulkan addresses, a short alias, an incomplete range, an unreadable list and a missing device address. It passed on Linux and as a Windows executable under Wine using a Vulkan test double. The final Linux CTest run passed 69 tests and skipped the same two listed above. A separate two-ray GPU test verified the KHR build on an RTX 4070 Ti, including a descriptor buffer imported from host memory. The Windows D3D12 shim changes remain unverified. [GPU test, results and reproduction instructions](tests/khr-instance-addresses/README.md)
 
+## Archive selection in hashdict
+
+The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
+
+After applying the ten runtime commits, apply this mailbox with `git am /path/to/archive-selection.mbox`. The resulting source tree is `4acb45e133883543f3db5e92c2b2c1748f37099d`. All 42 cases in `python -I tests/test_hashdict.py` passed on a fresh application. Before the fix, the same suite reproduced both the selection error and a successful exit for a misspelled name.
+
 ## Source and attribution
 
 - Shader fixes restore changes authored as Claude in [simomistralii/Leonida-PC PR 2](https://github.com/simomistralii/Leonida-PC/pull/2). The shader report identifies all three original commits.
