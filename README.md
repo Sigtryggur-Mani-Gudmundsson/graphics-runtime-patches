@@ -35,6 +35,20 @@ After the ten runtime commits, apply [direct-geometry.mbox](direct-geometry.mbox
 
 With the same imported triangle, the default XDXR builder previously produced bounds from x=4 to x=5. The patched builder produced the supplied bounds from x=0 to x=1. The optional KHR path also recovered the expected ray hit for both imported vertices and a contiguous imported instance array. These are Linux RTX 4070 Ti measurements. [Hardware reproduction and results](tests/khr-instance-addresses/README.md)
 
+## GPU-written instance pointers on the default XDXR backend
+
+Apply [xdxr-instance-pointers.mbox](xdxr-instance-pointers.mbox) after direct-geometry.mbox with `git am /path/to/xdxr-instance-pointers.mbox`. Without the independent archive-selection patch, the resulting tree is `fe9989a41c621574a59e2595dd4229a5fae757d1`. The mailbox includes the compute shader source and the generated include used by the normal runtime build. Compiling the shader with the command in xdxr_build_spv.h reproduced the include byte for byte.
+
+XDXR previously treated a top-level instance pointer list as a packed array of descriptors. The fix reads each pointer on the GPU and resolves it to the descriptor, including addresses in registered host imports. One test uses only arena addresses. Another mixes arena and imported addresses with an overlapping alias. The refit rewrites the pointer list on the GPU and changes the physical order of the descriptors.
+
+| Synthetic case, 1,000 rays each | Reference hits | Previous XDXR hits | Patched XDXR hits |
+| --- | ---: | ---: | ---: |
+| Arena pointers | 570 | 0 | 570 |
+| Mixed pointers | 575 | 0 | 575 |
+| Refit after GPU list rewrite | 539 | 0 | 539 |
+
+Linux and the cross-compiled Windows test under Wine used an RTX 4070 Ti. All 3,000 patched ray results matched the brute-force reference on each platform. To reproduce on Linux, build the runtime tests and run `ctest -R '^xdxr_build(_check)?$' --output-on-failure` in the build directory. The generator uses synthetic inputs and the checker compares GPU output with CPU traversal. Retail startup remains unverified.
+
 ## Archive selection in hashdict
 
 The optional [archive-selection.mbox](archive-selection.mbox) restores Yash Dubey’s fix from [ubiquitarianism/leonida PR 25](https://github.com/ubiquitarianism/leonida/pull/25) and adds a regression check for ordinary data in the second selected archive. Spaces around comma-separated archive names are accepted. An explicitly named archive missing from the index now produces a usage error before the tool writes the output dictionary.
