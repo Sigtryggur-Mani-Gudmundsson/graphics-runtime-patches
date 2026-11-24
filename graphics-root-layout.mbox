@@ -1,0 +1,235 @@
+From e7e089638fcdc06001117674ca61a6e466d65b77 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Tue, 24 Nov 2026 04:48:46 +0000
+Subject: [PATCH] Use the root signature's selected graphics packing for
+ validation and table writes
+
+---
+ runtime/CMakeLists.txt                |  4 ++
+ runtime/shims/d3d12_com.cpp           |  5 +-
+ runtime/shims/d3d12_com.h             |  1 +
+ runtime/shims/d3d12_vulkan_device.cpp | 34 +++++-----
+ runtime/test/d3d12_bundle_test.cpp    | 89 ++++++++++++++++++++++++++-
+ 5 files changed, 112 insertions(+), 21 deletions(-)
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index a094719f..d296eedb 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -3109,6 +3109,10 @@ if(TARGET Vulkan::Headers)
+       target_compile_options(d3d12_bundle_test PRIVATE /W4 /permissive- /utf-8)
+       add_test(NAME d3d12_bundle COMMAND d3d12_bundle_test)
+       set_tests_properties(d3d12_bundle PROPERTIES SKIP_RETURN_CODE 77)
++      add_test(NAME d3d12_root_layout_compact COMMAND d3d12_bundle_test --compact)
++      add_test(NAME d3d12_root_layout_legacy COMMAND d3d12_bundle_test --legacy)
++      set_tests_properties(d3d12_root_layout_compact PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_GRAPHICS_STAGE_LAYOUT=1")
++      set_tests_properties(d3d12_root_layout_legacy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_GRAPHICS_STAGE_LAYOUT=0")
+       # Calls a bundle may not make, Close of the bundle and of its parent, against the host runtime and WARP.
+       add_executable(d3d12_bundle_forbidden_test test/d3d12_bundle_forbidden_test.cpp)
+       target_link_libraries(d3d12_bundle_forbidden_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+diff --git a/runtime/shims/d3d12_com.cpp b/runtime/shims/d3d12_com.cpp
+index a1aa3ccc..414d20d9 100644
+--- a/runtime/shims/d3d12_com.cpp
++++ b/runtime/shims/d3d12_com.cpp
+@@ -1265,9 +1265,8 @@ private:
+             tables_.push_back({va, p->table_descriptors});
+         const std::uint32_t first = first_dword(state, *p);
+         write(state, first, std::uint32_t(va));
+-        // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
+-        // live below 4 GiB); a root view keeps both halves. The graphics layout gives every address two dwords.
+-        if (!((is_compute(state) || local_graphics_stage_layout()) && type == rt::rootsig::ParamType::Table))
++        // Stage-packed tables occupy one dword. Legacy tables and root views occupy two.
++        if (type != rt::rootsig::ParamType::Table || !(is_compute(state) || state.layout->graphics_compact_tables))
+             write(state, first + 1, std::uint32_t(va >> 32));
+     }
+ 
+diff --git a/runtime/shims/d3d12_com.h b/runtime/shims/d3d12_com.h
+index 2811ed1f..bbef1615 100644
+--- a/runtime/shims/d3d12_com.h
++++ b/runtime/shims/d3d12_com.h
+@@ -408,6 +408,7 @@ struct RootArgumentLayout {
+     };
+     std::vector<Parameter> parameters;
+     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
++    bool graphics_compact_tables = false;  // the selected graphics layout uses one dword per table
+     bool graphics_ok = true;
+     bool compute_ok = true;
+ };
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 1a9f1d6e..54e55888 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -6666,31 +6666,31 @@ public:
+             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
+             return E_INVALIDARG;
+         }
+-        // Two layouts, one per bind point (RootArgumentLayout): graphics keeps pack(), compute takes the console
+-        // layout pack_stage() measured (D3D-448). The signature is refused only when neither can place it.
++        // Select the graphics layout once. A stage layout that spills falls back to the default packing.
+         const rt::rootsig::PackResult packed = rt::rootsig::pack(parsed.sig);
++        RootArgumentLayout layout;
++        rt::rootsig::StagePackResult local_stage;
++        if (local_graphics_stage_layout()) {
++            local_stage = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
++            layout.graphics_compact_tables = local_stage.ok;
++            static std::atomic<int> said{0};
++            if (said.fetch_add(1) < 3)
++                std::fprintf(stderr, "[rt] d3d12: local: graphics root arguments in the console stage layout (from s%u): %s\n",
++                             local_stage.base, local_stage.ok ? "ok" : local_stage.error.c_str());
++        }
+         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
+-        if (!packed.ok && !compute.ok) {
++        layout.graphics_ok = layout.graphics_compact_tables || packed.ok;
++        layout.compute_ok = compute.ok;
++        layout.flags = parsed.sig.flags;
++        if (!layout.graphics_ok && !compute.ok) {
+             std::fprintf(stderr, "[rt] d3d12: root signature refused: %s (compute: %s)\n", packed.error.c_str(),
+                          compute.error.c_str());
+             return E_INVALIDARG;
+         }
+-        if (!packed.ok)
++        if (!layout.graphics_ok)
+             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
+         if (!compute.ok)
+             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
+-        RootArgumentLayout layout;
+-        layout.flags = parsed.sig.flags;
+-        layout.graphics_ok = packed.ok;
+-        layout.compute_ok = compute.ok;
+-        const rt::rootsig::StagePackResult local_stage = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Vertex);
+-        const bool local_stage_layout = local_graphics_stage_layout() && local_stage.ok;
+-        if (local_graphics_stage_layout()) {
+-            static std::atomic<int> said{0};
+-            if (said.fetch_add(1) < 3)
+-                std::fprintf(stderr, "[rt] d3d12: local: graphics root arguments in the console stage layout (from s%u): %s\n",
+-                             local_stage.base, local_stage.ok ? "ok" : local_stage.error.c_str());
+-        }
+         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
+             std::uint32_t first = UINT32_MAX;
+             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
+@@ -6698,7 +6698,7 @@ public:
+                     first = d;
+                     break;
+                 }
+-            if (local_stage_layout) first = local_stage.first_sgpr[i];
++            if (layout.graphics_compact_tables) first = local_stage.first_sgpr[i];
+             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                          table_view_descriptors(parsed.sig.params[i])});
+diff --git a/runtime/test/d3d12_bundle_test.cpp b/runtime/test/d3d12_bundle_test.cpp
+index 115a7d96..b7db7392 100644
+--- a/runtime/test/d3d12_bundle_test.cpp
++++ b/runtime/test/d3d12_bundle_test.cpp
+@@ -24,6 +24,7 @@
+ #include <dxgi1_4.h>
+ #include <io.h>
+ 
++#include <array>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+@@ -751,7 +752,77 @@ bool layer_checks(ID3D12Device* device, const std::vector<std::uint8_t>& vs, con
+     return true;
+ }
+ 
+-int main() {
++// Check the user data captured by DrawInstanced without submitting the synthetic table address to the GPU.
++bool root_layout_case(Rig& rig, UINT table_count, UINT constants, bool expect_graphics, bool compact) {
++    std::vector<D3D12_DESCRIPTOR_RANGE> ranges(table_count);
++    std::vector<D3D12_ROOT_PARAMETER> params(table_count + (constants != 0));
++    for (UINT i = 0; i < table_count; ++i) {
++        ranges[i] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, i, 0, 0};
++        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++        params[i].DescriptorTable = {1, &ranges[i]};
++    }
++    if (constants) {
++        params.back().ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++        params.back().Constants = {0, 0, constants};
++    }
++    D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{};
++    desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
++    desc.Desc_1_0 = {UINT(params.size()), params.data(), 0, nullptr,
++                     D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
++    const auto blob = serialize_root_signature(desc);
++    CHECK(!blob.empty());
++    Ref<ID3D12RootSignature> root;
++    CHECK(rig.device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p)) == S_OK);
++    Ref<ID3D12CommandAllocator> alloc;
++    Ref<ID3D12GraphicsCommandList> list;
++    CHECK(rig.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p)) == S_OK);
++    CHECK(rig.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr,
++                                        IID_PPV_ARGS(&list.p)) == S_OK);
++    // These signatures fit the compute layout, including the graphics spill case.
++    list->SetComputeRootSignature(root.p);
++    CHECK(list->Close() == S_OK);
++    CHECK(list->Reset(alloc.p, nullptr) == S_OK);
++    list->SetGraphicsRootSignature(root.p);
++    if (!expect_graphics) {
++        CHECK(list->Close() == E_INVALIDARG);
++        return true;
++    }
++
++    Ref<ID3D12PipelineState> pso;
++    CHECK(rig.make_pso(root.p, D3D12_COLOR_WRITE_ENABLE_ALL, pso));
++    list->SetPipelineState(pso.p);
++    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    const D3D12_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
++    list->RSSetViewports(1, &viewport);
++    constexpr UINT sentinel = 0xabcdef01;
++    if (constants) list->SetGraphicsRoot32BitConstant(table_count, sentinel, 0);
++    std::array<std::uint32_t, 32> expected{};
++    UINT offset = compact ? 8 : 0;
++    for (UINT i = 0; i < table_count; ++i) {
++        const UINT64 handle = 0x1122334455667788ull + i;
++        list->SetGraphicsRootDescriptorTable(i, {handle});
++        expected[offset++] = UINT(handle);
++        if (!compact) expected[offset++] = UINT(handle >> 32);
++    }
++    if (constants) expected[offset] = sentinel;
++    list->DrawInstanced(3, 1, 0, 0);
++    CHECK(list->Close() == S_OK);
++    std::vector<leonida::Command> commands;
++    CHECK(rt::d3d12::recorded_commands(list.p, commands));
++    CHECK(commands.size() == 1);
++    const auto* draw = std::get_if<leonida::Draw>(&commands.front());
++    CHECK(draw);
++    for (std::size_t i = 0; i < expected.size(); ++i) {
++        if (draw->user_data[i] != expected[i]) {
++            std::fprintf(stderr, "%u tables and %u constants: s%zu = %08x, expected %08x\n",
++                         table_count, constants, i, draw->user_data[i], expected[i]);
++            return false;
++        }
++    }
++    return true;
++}
++
++int main(int argc, char** argv) {
+     std::setvbuf(stdout, nullptr, _IONBF, 0);
+     vktest::Device vk;
+     const auto device_status = vk.initialize();
+@@ -796,6 +867,22 @@ int main() {
+         info.shader_dir = library.string();
+         Ref<ID3D12Device> ours;
+         REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p))));
++        if (argc == 2) {
++            const bool stage = std::strcmp(argv[1], "--compact") == 0;
++            REQUIRE(stage || std::strcmp(argv[1], "--legacy") == 0);
++            Rig rig;
++            rig.device = ours.p;
++            rig.vs_code = vs_container;
++            rig.ps_code = ps_container;
++            const bool fallback = root_layout_case(rig, 1, 24, true, false);
++            const bool ordinary = root_layout_case(rig, 1, 1, true, stage);
++            const bool wide = root_layout_case(rig, 17, 0, stage, stage);
++            const bool last_register = root_layout_case(rig, 24, 0, stage, stage);
++            const bool spill = root_layout_case(rig, 25, 0, false, false);
++            REQUIRE(fallback && ordinary && wide && last_register && spill);
++            REQUIRE(vk.validation_errors() == errors_before);
++            return 0;
++        }
+         REQUIRE(run_all(ours.p, false, nullptr, vs_container, ps_container, list, layer_grids, layer_closes));
+         REQUIRE(layer_checks(ours.p, vs_container, ps_container, library));
+     }
+-- 
+2.56.1
+
